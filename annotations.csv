@@ -1,0 +1,11 @@
+video,label,start_sec,end_sec
+accident01.mp4,1,3.2,5.6
+accident02.mp4,1,5,8
+accident03.mp4,1,7,12
+accident04.mp4,1,2,6
+accident05.mp4,1,6,8
+normal01.mp4,0,0,0
+normal02.mp4,0,0,0
+normal03.mp4,0,0,0
+normal04.mp4,0,0,0
+normal05.mp4,0,0,0

@@ -8,21 +8,28 @@ from accident_logic import (
     collision_score
 )
 
-# -----------------------------
+from temporal_detector import TemporalAccidentDetector
+
+
+# ============================================================
 # SETTINGS
-# -----------------------------
+# ============================================================
 
 VIDEO_PATH = "data/accident.mp4"
 
-ACCIDENT_THRESHOLD = 70
+# Score at which the scene becomes suspicious
+SUSPICIOUS_SCORE = 30
+
+# Number of consecutive observations required
 CONFIRMATION_FRAMES = 3
+
+# How long the confirmed alert remains active
 ALERT_DURATION = 5
 
 
-# ------------------------
-
+# ============================================================
 # LOAD YOLO
-# --------------------------
+# ============================================================
 
 print("Loading YOLO...")
 
@@ -37,19 +44,27 @@ if not video.isOpened():
 print("Video opened successfully.")
 
 
-# -----------------------------
+# ============================================================
 # ACCIDENT STATE
-# -----------------------------
+# ============================================================
 
 accident_active = False
 accident_start_time = 0
 
-suspicious_frames = 0
+temporal_detector = TemporalAccidentDetector(
+    evidence_threshold=0.30,
+    confirmation_windows=CONFIRMATION_FRAMES,
+    history_size=5,
+    minimum_suspicious_ratio=0.67
+)
+
+confirmation_status = "NORMAL"
+confirmation_confidence = 0.0
 
 
-# -----------------------------
+# ============================================================
 # MAIN LOOP
-# -----------------------------
+# ============================================================
 
 while True:
 
@@ -59,9 +74,9 @@ while True:
         print("Video finished.")
         break
 
-    # -----------------------------
+    # ========================================================
     # YOLO + BYTE TRACK
-    # -----------------------------
+    # ========================================================
 
     results = model.track(
         frame,
@@ -75,26 +90,51 @@ while True:
 
     vehicles = {}
 
-
-    # -----------------------------
+    # ========================================================
     # GET VEHICLE INFORMATION
-    # -----------------------------
+    # ========================================================
 
-    if result.boxes is not None and result.boxes.id is not None:
+    if (
+        result.boxes is not None
+        and result.boxes.id is not None
+    ):
 
-        boxes = result.boxes.xyxy.cpu().numpy()
-        ids = result.boxes.id.cpu().numpy().astype(int)
+        boxes = (
+            result.boxes.xyxy
+            .cpu()
+            .numpy()
+        )
+
+        ids = (
+            result.boxes.id
+            .cpu()
+            .numpy()
+            .astype(int)
+        )
 
         for box, vehicle_id in zip(boxes, ids):
 
             x1, y1, x2, y2 = box
 
-            center_x = int((x1 + x2) / 2)
-            center_y = int((y1 + y2) / 2)
+            center_x = int(
+                (x1 + x2) / 2
+            )
+
+            center_y = int(
+                (y1 + y2) / 2
+            )
 
             vehicles[vehicle_id] = {
-                "center": (center_x, center_y),
-                "box": (x1, y1, x2, y2)
+                "center": (
+                    center_x,
+                    center_y
+                ),
+                "box": (
+                    x1,
+                    y1,
+                    x2,
+                    y2
+                )
             }
 
             update_vehicle(
@@ -102,81 +142,117 @@ while True:
                 (center_x, center_y)
             )
 
-
-    # -----------------------------
+    # ========================================================
     # CALCULATE ACCIDENT SCORE
-    # -----------------------------
+    # ========================================================
 
     score, collision_pairs = collision_score(
         vehicles
     )
 
+    # ========================================================
+    # TEMPORAL CONFIRMATION
+    # ========================================================
 
-    # -----------------------------
-    # MULTI-FRAME CONFIRMATION
-    # -----------------------------
+    evidence_score = min(
+        score / 100.0,
+        1.0
+    )
 
-    if not accident_active:
+    collision_evidence = (
+        len(collision_pairs) > 0
+    )
 
-        if score >= ACCIDENT_THRESHOLD:
+    approach_evidence = (
+        score >= SUSPICIOUS_SCORE
+    )
 
-            suspicious_frames = min(
-                suspicious_frames + 1,
-                CONFIRMATION_FRAMES
-            )
+    confirmation = temporal_detector.update(
+        evidence_score=evidence_score,
+        collision_evidence=collision_evidence,
+        approach_evidence=approach_evidence
+    )
 
-        else:
+    confirmation_status = (
+        confirmation["status"]
+    )
 
-            suspicious_frames = 0
+    confirmation_confidence = (
+        confirmation["confidence"]
+    )
 
-
-    # -----------------------------
-    # CONFIRM ACCIDENT
-    # -----------------------------
+    # ========================================================
+    # ACCIDENT CONFIRMED
+    # ========================================================
 
     if (
-        suspicious_frames == CONFIRMATION_FRAMES
+        confirmation["confirmed"]
         and not accident_active
     ):
 
         accident_active = True
+
         accident_start_time = time.time()
+
+        confirmation_status = "ACCIDENT CONFIRMED"
 
         print()
         print("================================")
         print("ACCIDENT CONFIRMED")
-        print("Score:", score)
-        print("Vehicles:", collision_pairs)
+        print(
+            "Evidence Score:",
+            score
+        )
+        print(
+            "Confirmation:",
+            confirmation_confidence
+        )
+        print(
+            "Vehicles:",
+            collision_pairs
+        )
         print("================================")
         print()
 
-
-    # -----------------------------
+    # ========================================================
     # KEEP ALERT ACTIVE
-    # -----------------------------
+    # ========================================================
 
     if accident_active:
 
-        elapsed = time.time() - accident_start_time
+        elapsed = (
+            time.time()
+            - accident_start_time
+        )
 
         if elapsed >= ALERT_DURATION:
 
             accident_active = False
-            suspicious_frames = 0
 
-            print("Accident alert cleared.")
+            temporal_detector.reset()
 
+            confirmation_status = "NORMAL"
 
-    # -----------------------------
-    # DRAW DETECTIONS
-    # -----------------------------
+            confirmation_confidence = 0.0
+
+            print(
+                "Accident alert cleared."
+            )
+
+        else:
+
+            # Keep confirmed state locked
+            confirmation_status = "ACCIDENT CONFIRMED"
+
+    # ========================================================
+    # DRAW YOLO DETECTIONS
+    # ========================================================
 
     annotated_frame = result.plot()
 
-
-    # -----------------------------
-    # DISPLAY SCORE
-    # -----------------------------
+    # ========================================================
+    # DISPLAY ACCIDENT SCORE
+    # ========================================================
 
     cv2.putText(
         annotated_frame,
@@ -188,14 +264,13 @@ while True:
         2
     )
 
-
-    # -----------------------------
+    # ========================================================
     # DISPLAY CONFIRMATION
-    # -----------------------------
+    # ========================================================
 
     cv2.putText(
         annotated_frame,
-        f"Confirmation: {suspicious_frames}/{CONFIRMATION_FRAMES}",
+        f"Confirmation: {confirmation_status}",
         (30, 85),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
@@ -203,10 +278,9 @@ while True:
         2
     )
 
-
-    # -----------------------------
+    # ========================================================
     # DISPLAY STATUS
-    # -----------------------------
+    # ========================================================
 
     if accident_active:
 
@@ -220,7 +294,7 @@ while True:
             3
         )
 
-    elif score >= 30:
+    elif confirmation_status == "SUSPICIOUS":
 
         cv2.putText(
             annotated_frame,
@@ -244,30 +318,31 @@ while True:
             3
         )
 
-
-    # -----------------------------
+    # ========================================================
     # SHOW VIDEO
-    # -----------------------------
+    # ========================================================
 
     cv2.imshow(
         "ResQTrack - Accident Detection",
         annotated_frame
     )
 
-
-    # -----------------------------
+    # ========================================================
     # QUIT
-    # -----------------------------
+    # ========================================================
 
-    if cv2.waitKey(1) & 0xFF == ord("q"):
+    key = cv2.waitKey(1) & 0xFF
+
+    if key == ord("q"):
         break
 
 
-# -----------------------------
+# ============================================================
 # CLEANUP
-# -----------------------------
+# ============================================================
 
 video.release()
+
 cv2.destroyAllWindows()
 
 print("ResQTrack stopped.")

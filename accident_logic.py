@@ -1,7 +1,16 @@
 import math
 
-vehicle_history = {}
+# ============================================================
+# VEHICLE TRAJECTORY STATE
+# ============================================================
 
+vehicle_history = {}
+pair_distance_history = {}
+
+
+# ============================================================
+# BASIC GEOMETRY
+# ============================================================
 
 def distance(p1, p2):
     return math.sqrt(
@@ -23,16 +32,37 @@ def calculate_iou(box1, box2):
 
     intersection = width * height
 
-    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    area1 = (
+        max(0, box1[2] - box1[0]) *
+        max(0, box1[3] - box1[1])
+    )
+
+    area2 = (
+        max(0, box2[2] - box2[0]) *
+        max(0, box2[3] - box2[1])
+    )
 
     union = area1 + area2 - intersection
 
     if union <= 0:
-        return 0
+        return 0.0
 
     return intersection / union
 
+
+# ============================================================
+# RESET STATE
+# ============================================================
+
+def reset_vehicle_history():
+
+    vehicle_history.clear()
+    pair_distance_history.clear()
+
+
+# ============================================================
+# VEHICLE TRAJECTORY
+# ============================================================
 
 def update_vehicle(vehicle_id, center):
 
@@ -46,31 +76,40 @@ def update_vehicle(vehicle_id, center):
 
     data = vehicle_history[vehicle_id]
 
-    movement = 0
-    direction = (0, 0)
+    movement = 0.0
+    direction = (0.0, 0.0)
 
-    if len(data["positions"]) > 0:
+    if data["positions"]:
 
         previous = data["positions"][-1]
 
         dx = center[0] - previous[0]
         dy = center[1] - previous[1]
 
-        movement = distance(previous, center)
+        movement = distance(
+            previous,
+            center
+        )
 
-        direction = (dx, dy)
+        direction = (
+            dx,
+            dy
+        )
 
     data["positions"].append(center)
     data["movements"].append(movement)
     data["directions"].append(direction)
 
-    # Keep recent history
     data["positions"] = data["positions"][-20:]
     data["movements"] = data["movements"][-20:]
     data["directions"] = data["directions"][-20:]
 
     return movement
 
+
+# ============================================================
+# MOTION FEATURES
+# ============================================================
 
 def sudden_stop(vehicle_id):
 
@@ -85,10 +124,18 @@ def sudden_stop(vehicle_id):
     previous = movements[-8:-3]
     recent = movements[-3:]
 
-    previous_avg = sum(previous) / len(previous)
-    recent_avg = sum(recent) / len(recent)
+    previous_avg = (
+        sum(previous) / len(previous)
+    )
 
-    return previous_avg > 5 and recent_avg < 2
+    recent_avg = (
+        sum(recent) / len(recent)
+    )
+
+    return (
+        previous_avg > 5
+        and recent_avg < 2
+    )
 
 
 def sudden_direction_change(vehicle_id):
@@ -104,28 +151,98 @@ def sudden_direction_change(vehicle_id):
     old_dx, old_dy = directions[-5]
     new_dx, new_dy = directions[-1]
 
-    old_magnitude = math.sqrt(old_dx ** 2 + old_dy ** 2)
-    new_magnitude = math.sqrt(new_dx ** 2 + new_dy ** 2)
+    old_magnitude = math.hypot(
+        old_dx,
+        old_dy
+    )
+
+    new_magnitude = math.hypot(
+        new_dx,
+        new_dy
+    )
 
     if old_magnitude < 3 or new_magnitude < 3:
         return False
 
-    dot = old_dx * new_dx + old_dy * new_dy
-
-    cosine = dot / (
-        old_magnitude * new_magnitude
+    dot = (
+        old_dx * new_dx
+        +
+        old_dy * new_dy
     )
 
-    # Large direction change
+    cosine = (
+        dot /
+        (old_magnitude * new_magnitude)
+    )
+
+    cosine = max(
+        -1.0,
+        min(1.0, cosine)
+    )
+
     return cosine < 0.5
 
+
+# ============================================================
+# PAIR APPROACH EVIDENCE
+# ============================================================
+
+def _pair_is_approaching(
+    id1,
+    id2,
+    current_distance
+):
+
+    pair_key = tuple(
+        sorted((id1, id2))
+    )
+
+    history = pair_distance_history.setdefault(
+        pair_key,
+        []
+    )
+
+    approaching = False
+
+    if len(history) >= 2:
+
+        recent_reference = (
+            sum(history[-3:])
+            /
+            min(3, len(history))
+        )
+
+        reduction = (
+            recent_reference
+            -
+            current_distance
+        )
+
+        if reduction > 8:
+            approaching = True
+
+    history.append(current_distance)
+
+    pair_distance_history[pair_key] = (
+        history[-6:]
+    )
+
+    return approaching
+
+
+# ============================================================
+# COLLISION SCORE
+# ============================================================
 
 def collision_score(vehicles):
 
     score = 0
+
     collision_pairs = []
 
-    ids = list(vehicles.keys())
+    ids = list(
+        vehicles.keys()
+    )
 
     for i in range(len(ids)):
 
@@ -143,47 +260,67 @@ def collision_score(vehicles):
             box1 = v1["box"]
             box2 = v2["box"]
 
-            d = distance(center1, center2)
+            d = distance(
+                center1,
+                center2
+            )
 
-            iou = calculate_iou(box1, box2)
+            iou = calculate_iou(
+                box1,
+                box2
+            )
 
             pair_score = 0
 
-            # -------------------------
-            # Collision proximity
-            # -------------------------
+            # ------------------------------------------------
+            # PHYSICAL PROXIMITY
+            # ------------------------------------------------
 
-            if iou > 0.10:
-                pair_score += 30
+            if iou > 0.15:
 
-            elif d < 60:
-                pair_score += 15
+                pair_score += 35
 
-            # -------------------------
-            # Sudden stop
-            # -------------------------
+            elif d < 45:
+
+                pair_score += 20
+
+            # ------------------------------------------------
+            # APPROACHING VEHICLES
+            # ------------------------------------------------
+
+            if _pair_is_approaching(
+                id1,
+                id2,
+                d
+            ):
+
+                pair_score += 10
+
+            # ------------------------------------------------
+            # SUDDEN STOP
+            # ------------------------------------------------
 
             if sudden_stop(id1):
-                pair_score += 20
+                pair_score += 15
 
             if sudden_stop(id2):
-                pair_score += 20
+                pair_score += 15
 
-            # -------------------------
-            # Sudden direction change
-            # -------------------------
+            # ------------------------------------------------
+            # DIRECTION CHANGE
+            # ------------------------------------------------
 
             if sudden_direction_change(id1):
-                pair_score += 15
+                pair_score += 10
 
             if sudden_direction_change(id2):
-                pair_score += 15
+                pair_score += 10
 
-            # -------------------------
-            # Register suspicious pair
-            # -------------------------
+            # ------------------------------------------------
+            # COLLISION EVIDENCE
+            # ------------------------------------------------
 
-            if pair_score >= 30:
+            if pair_score >= 40:
 
                 collision_pairs.append(
                     (id1, id2)
@@ -191,4 +328,7 @@ def collision_score(vehicles):
 
                 score += pair_score
 
-    return min(score, 100), collision_pairs
+    return (
+        min(score, 100),
+        collision_pairs
+    )

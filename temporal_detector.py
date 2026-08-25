@@ -1,17 +1,3 @@
-"""
-ResQTrack - Temporal Accident Confirmation Engine
-
-Designed for short-duration accident events.
-
-Confirmation is based on:
-1. Persistent suspicion across recent observations
-2. At least one physical accident indication
-3. At least one strong evidence observation
-
-A brief collision does not need to remain visible
-for every frame.
-"""
-
 from collections import deque
 
 
@@ -20,30 +6,24 @@ class TemporalAccidentDetector:
     def __init__(
         self,
         evidence_threshold=0.30,
-        confirmation_windows=3,
-        history_size=5,
-        minimum_suspicious_ratio=0.67,
-        strong_evidence_threshold=0.35
+        lookback=10,
+        minimum_suspicious_observations=2,
+        physical_event_threshold=0.40
     ):
 
-        self.evidence_threshold = (
-            evidence_threshold
+        self.evidence_threshold = evidence_threshold
+        self.lookback = lookback
+
+        self.minimum_suspicious_observations = (
+            minimum_suspicious_observations
         )
 
-        self.confirmation_windows = (
-            confirmation_windows
+        self.physical_event_threshold = (
+            physical_event_threshold
         )
 
         self.history = deque(
-            maxlen=history_size
-        )
-
-        self.minimum_suspicious_ratio = (
-            minimum_suspicious_ratio
-        )
-
-        self.strong_evidence_threshold = (
-            strong_evidence_threshold
+            maxlen=lookback
         )
 
         self.accident_confirmed = False
@@ -56,29 +36,41 @@ class TemporalAccidentDetector:
     def update(
         self,
         evidence_score,
-        collision_evidence=False,
-        approach_evidence=False
+        physical_score,
+        collision_evidence=False
     ):
 
         evidence_score = float(
             evidence_score
         )
 
+        physical_score = float(
+            physical_score
+        )
+
         suspicious = (
-            evidence_score >=
+            evidence_score
+            >=
             self.evidence_threshold
         )
 
+        # A strong physical score itself is treated
+        # as an accident-event observation.
         physical_event = (
-            bool(collision_evidence)
+            physical_score
+            >=
+            self.physical_event_threshold
             or
-            bool(approach_evidence)
+            bool(collision_evidence)
         )
 
         self.history.append({
 
             "evidence_score":
                 evidence_score,
+
+            "physical_score":
+                physical_score,
 
             "suspicious":
                 suspicious,
@@ -96,29 +88,20 @@ class TemporalAccidentDetector:
 
     def _evaluate(self):
 
-        if (
-            len(self.history)
-            <
-            self.confirmation_windows
-        ):
+        if not self.history:
 
             return {
                 "status": "NORMAL",
                 "confirmed": False,
-                "confidence": 0.0,
-                "suspicious_ratio": 0.0
+                "confidence": 0.0
             }
 
 
-        recent = list(
-            self.history
-        )[
-            -self.confirmation_windows:
-        ]
+        recent = list(self.history)
 
 
         # ------------------------------------------------------
-        # HOW MANY RECENT OBSERVATIONS ARE SUSPICIOUS?
+        # ML / COMBINED SUSPICION
         # ------------------------------------------------------
 
         suspicious_count = sum(
@@ -126,14 +109,9 @@ class TemporalAccidentDetector:
             for item in recent
         )
 
-        suspicious_ratio = (
-            suspicious_count /
-            len(recent)
-        )
-
 
         # ------------------------------------------------------
-        # WAS THERE ANY PHYSICAL EVENT?
+        # PHYSICAL EVENT
         # ------------------------------------------------------
 
         physical_event_seen = any(
@@ -143,10 +121,7 @@ class TemporalAccidentDetector:
 
 
         # ------------------------------------------------------
-        # STRONGEST EVIDENCE IN THE WINDOW
-        #
-        # We use MAX rather than average because an accident
-        # can be extremely brief.
+        # PEAK EVIDENCE
         # ------------------------------------------------------
 
         peak_evidence = max(
@@ -156,46 +131,44 @@ class TemporalAccidentDetector:
 
 
         # ------------------------------------------------------
-        # AVERAGE FOR DISPLAY ONLY
+        # PEAK PHYSICAL SCORE
         # ------------------------------------------------------
 
-        average_evidence = (
-            sum(
-                item["evidence_score"]
-                for item in recent
-            )
-            /
-            len(recent)
-        )
-
-
-        # ------------------------------------------------------
-        # CONDITIONS
-        # ------------------------------------------------------
-
-        persistent_suspicion = (
-            suspicious_ratio
-            >=
-            self.minimum_suspicious_ratio
-        )
-
-        strong_event = (
-            peak_evidence
-            >=
-            self.strong_evidence_threshold
+        peak_physical = max(
+            item["physical_score"]
+            for item in recent
         )
 
 
         # ======================================================
-        # FINAL ACCIDENT CONFIRMATION
+        # CONFIRMATION
+        # ======================================================
+        #
+        # We deliberately do NOT require the physical spike
+        # to happen in the same frame as the ML peak.
+        #
+        # This is important because a real collision can cause:
+        #
+        # frame 1 → approach
+        # frame 2 → collision
+        # frame 3 → tracker separation
+        #
         # ======================================================
 
         if (
-            persistent_suspicion
+            suspicious_count
+            >=
+            self.minimum_suspicious_observations
+
             and
+
             physical_event_seen
+
             and
-            strong_event
+
+            peak_evidence
+            >=
+            self.evidence_threshold
         ):
 
             self.accident_confirmed = True
@@ -210,13 +183,10 @@ class TemporalAccidentDetector:
 
                 "confidence":
                     round(
-                        peak_evidence,
-                        3
-                    ),
-
-                "suspicious_ratio":
-                    round(
-                        suspicious_ratio,
+                        max(
+                            peak_evidence,
+                            peak_physical
+                        ),
                         3
                     )
             }
@@ -238,13 +208,10 @@ class TemporalAccidentDetector:
 
                 "confidence":
                     round(
-                        peak_evidence,
-                        3
-                    ),
-
-                "suspicious_ratio":
-                    round(
-                        suspicious_ratio,
+                        max(
+                            peak_evidence,
+                            peak_physical
+                        ),
                         3
                     )
             }
@@ -263,16 +230,7 @@ class TemporalAccidentDetector:
                 False,
 
             "confidence":
-                round(
-                    average_evidence,
-                    3
-                ),
-
-            "suspicious_ratio":
-                round(
-                    suspicious_ratio,
-                    3
-                )
+                0.0
         }
 
 

@@ -58,20 +58,11 @@ def process_video(video_path):
     reset_vehicle_history()
 
     detector = TemporalAccidentDetector(
-
-        evidence_threshold=0.30,
-
-        confirmation_windows=
-            CONFIRMATION_FRAMES,
-
-        history_size=5,
-
-        minimum_suspicious_ratio=0.67,
-
-        strong_evidence_threshold=0.40,
-
-        minimum_support_windows=2
-    )
+    evidence_threshold=0.30,
+    lookback=10,
+    minimum_suspicious_observations=2,
+    physical_event_threshold=0.40
+)
 
     video = cv2.VideoCapture(
         video_path
@@ -235,29 +226,18 @@ def process_video(video_path):
             len(collision_pairs) > 0
         )
 
-        approach_evidence = (
-            score >= SUSPICIOUS_SCORE
-        )
+        
 
 
         # ----------------------------------------------------
         # TEMPORAL DETECTOR
         # ----------------------------------------------------
 
-        confirmation = (
-            detector.update(
-
-                evidence_score=
-                    evidence_score,
-
-                collision_evidence=
-                    collision_evidence,
-
-                approach_evidence=
-                    approach_evidence
-            )
-        )
-
+        confirmation = detector.update(
+    evidence_score=evidence_score,
+    physical_score=score / 100.0,
+    collision_evidence=collision_evidence
+)
 
         # ----------------------------------------------------
         # CONFIRMED

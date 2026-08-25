@@ -63,12 +63,11 @@ print("Video opened successfully.")
 
 reset_vehicle_history()
 ml_engine.reset()
-
 temporal_detector = TemporalAccidentDetector(
     evidence_threshold=0.30,
-    confirmation_windows=CONFIRMATION_FRAMES,
-    history_size=5,
-    minimum_suspicious_ratio=0.67
+    lookback=10,
+    minimum_suspicious_observations=2,
+    physical_event_threshold=0.40
 )
 
 
@@ -252,7 +251,7 @@ while running:
     # ML probability alone cannot create physical evidence.
     #
 
-    approach_evidence = physical_suspicious
+    
 
 
     # ========================================================
@@ -260,10 +259,10 @@ while running:
     # ========================================================
 
     confirmation = temporal_detector.update(
-        evidence_score=combined_evidence,
-        collision_evidence=collision_evidence,
-        approach_evidence=approach_evidence
-    )
+    evidence_score=combined_evidence,
+    physical_score=physical_evidence,
+    collision_evidence=collision_evidence
+)
 
     confirmation_status = confirmation["status"]
 

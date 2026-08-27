@@ -1,11 +1,22 @@
-from fastapi.responses import FileResponse
+import math
+import sqlite3
 from datetime import datetime, timezone
-from math import radians, sin, cos, sqrt, atan2
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
+
+
+# ============================================================
+# PATHS
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+DB_FILE = BASE_DIR / "resqtrack.db"
 
 
 # ============================================================
@@ -14,9 +25,8 @@ from pydantic import BaseModel
 
 app = FastAPI(
     title="ResQTrack Emergency Response API",
-    version="1.0.0"
+    version="2.0"
 )
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,17 +38,134 @@ app.add_middleware(
 
 
 # ============================================================
-# IN-MEMORY DATABASE
-#
-# We deliberately start simple.
-# We will move this to SQLite next.
+# DATABASE
 # ============================================================
 
-incidents = {}
+def get_db():
 
-responders = {}
+    connection = sqlite3.connect(
+        DB_FILE
+    )
 
-connections = {}
+    connection.row_factory = sqlite3.Row
+
+    return connection
+
+
+def init_database():
+
+    connection = get_db()
+
+    cursor = connection.cursor()
+
+    cursor.executescript("""
+        CREATE TABLE IF NOT EXISTS responders (
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            responder_id TEXT UNIQUE NOT NULL,
+
+            name TEXT NOT NULL,
+
+            responder_type TEXT NOT NULL,
+
+            latitude REAL NOT NULL,
+
+            longitude REAL NOT NULL,
+
+            status TEXT NOT NULL DEFAULT 'AVAILABLE',
+
+            phone TEXT,
+
+            registered_at TEXT NOT NULL,
+
+            last_seen TEXT NOT NULL
+        );
+
+
+        CREATE TABLE IF NOT EXISTS incidents (
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            incident_id TEXT UNIQUE NOT NULL,
+
+            status TEXT NOT NULL,
+
+            confidence REAL NOT NULL,
+
+            latitude REAL NOT NULL,
+
+            longitude REAL NOT NULL,
+
+            camera_id TEXT NOT NULL,
+
+            frame INTEGER,
+
+            created_at TEXT NOT NULL,
+
+            assigned_responder TEXT
+        );
+
+
+        CREATE TABLE IF NOT EXISTS location_history (
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            responder_id TEXT NOT NULL,
+
+            latitude REAL NOT NULL,
+
+            longitude REAL NOT NULL,
+
+            accuracy REAL,
+
+            timestamp TEXT NOT NULL,
+
+            FOREIGN KEY (
+                responder_id
+            )
+            REFERENCES responders (
+                responder_id
+            )
+        );
+
+
+        CREATE TABLE IF NOT EXISTS dispatches (
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            incident_id TEXT NOT NULL,
+
+            responder_id TEXT NOT NULL,
+
+            status TEXT NOT NULL,
+
+            sent_at TEXT NOT NULL,
+
+            accepted_at TEXT,
+
+            FOREIGN KEY (
+                incident_id
+            )
+            REFERENCES incidents (
+                incident_id
+            ),
+
+            FOREIGN KEY (
+                responder_id
+            )
+            REFERENCES responders (
+                responder_id
+            )
+        );
+    """)
+
+    connection.commit()
+
+    connection.close()
+
+
+init_database()
 
 
 # ============================================================
@@ -77,6 +204,8 @@ class LocationUpdate(BaseModel):
 
     longitude: float
 
+    accuracy: Optional[float] = None
+
 
 class StatusUpdate(BaseModel):
 
@@ -87,10 +216,52 @@ class StatusUpdate(BaseModel):
 # HELPERS
 # ============================================================
 
-def generate_incident_id():
+def now_utc():
+
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
+
+
+def next_incident_id(
+    connection
+):
+
+    row = connection.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM incidents
+        """
+    ).fetchone()
+
+    number = (
+        int(row["count"])
+        + 1
+    )
 
     return (
-        f"RQ-{len(incidents) + 1:05d}"
+        f"RQ-{number:05d}"
+    )
+
+
+def next_responder_id(
+    connection
+):
+
+    row = connection.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM responders
+        """
+    ).fetchone()
+
+    number = (
+        int(row["count"])
+        + 1
+    )
+
+    return (
+        f"RESP-{number:04d}"
     )
 
 
@@ -103,35 +274,62 @@ def haversine_km(
 
     earth_radius = 6371.0
 
-    dlat = radians(
+    dlat = math.radians(
         lat2 - lat1
     )
 
-    dlon = radians(
+    dlon = math.radians(
         lon2 - lon1
     )
 
     a = (
 
-        sin(dlat / 2) ** 2
+        math.sin(
+            dlat / 2
+        ) ** 2
 
         +
 
-        cos(radians(lat1))
+        math.cos(
+            math.radians(lat1)
+        )
+
         *
-        cos(radians(lat2))
+
+        math.cos(
+            math.radians(lat2)
+        )
+
         *
-        sin(dlon / 2) ** 2
+
+        math.sin(
+            dlon / 2
+        ) ** 2
     )
 
-    c = 2 * atan2(
-        sqrt(a),
-        sqrt(1 - a)
+    c = (
+        2
+        *
+        math.atan2(
+            math.sqrt(a),
+            math.sqrt(1 - a)
+        )
     )
 
     return (
-        earth_radius * c
+        earth_radius
+        *
+        c
     )
+
+
+def row_to_dict(row):
+
+    if row is None:
+
+        return None
+
+    return dict(row)
 
 
 # ============================================================
@@ -141,18 +339,50 @@ def haversine_km(
 @app.get("/api/health")
 def health():
 
+    connection = get_db()
+
+    incidents_count = connection.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM incidents
+        """
+    ).fetchone()["count"]
+
+    responders_count = connection.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM responders
+        """
+    ).fetchone()["count"]
+
+    connection.close()
+
     return {
 
-        "service": "ResQTrack",
+        "service":
+            "ResQTrack",
 
-        "status": "ONLINE",
+        "status":
+            "ONLINE",
 
         "incidents":
-            len(incidents),
+            incidents_count,
 
         "responders":
-            len(responders)
+            responders_count
     }
+
+
+# ============================================================
+# RESPONDER PAGE
+# ============================================================
+
+@app.get("/responder")
+def responder_page():
+
+    return FileResponse(
+        BASE_DIR / "responder.html"
+    )
 
 
 # ============================================================
@@ -160,83 +390,79 @@ def health():
 # ============================================================
 
 @app.post("/api/incidents")
-async def create_incident(
+def create_incident(
     data: IncidentCreate
 ):
 
-    incident_id = (
-        generate_incident_id()
+    connection = get_db()
+
+    incident_id = next_incident_id(
+        connection
     )
 
-    incident = {
+    created_at = now_utc()
 
-        "incident_id":
+    connection.execute(
+        """
+        INSERT INTO incidents (
             incident_id,
-
-        "status":
+            status,
+            confidence,
+            latitude,
+            longitude,
+            camera_id,
+            frame,
+            created_at,
+            assigned_responder
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            incident_id,
             "ACCIDENT_CONFIRMED",
-
-        "confidence":
             data.confidence,
-
-        "latitude":
             data.latitude,
-
-        "longitude":
             data.longitude,
-
-        "camera_id":
             data.camera_id,
-
-        "frame":
             data.frame,
-
-        "created_at":
-            datetime.now(
-                timezone.utc
-            ).isoformat(),
-
-        "assigned_responder":
+            created_at,
             None
-    }
+        )
+    )
+
+    connection.commit()
+
+    incident = connection.execute(
+        """
+        SELECT *
+        FROM incidents
+        WHERE incident_id = ?
+        """,
+        (incident_id,)
+    ).fetchone()
 
 
-    incidents[
-        incident_id
-    ] = incident
+    nearby_rows = connection.execute(
+        """
+        SELECT *
+        FROM responders
+        WHERE status = 'AVAILABLE'
+        """
+    ).fetchall()
 
-
-    # --------------------------------------------------------
-    # FIND NEARBY RESPONDERS
-    # --------------------------------------------------------
 
     nearby = []
 
-
-    for responder in responders.values():
-
-        if responder[
-            "status"
-        ] != "AVAILABLE":
-
-            continue
-
+    for responder in nearby_rows:
 
         distance = haversine_km(
 
             data.latitude,
-
             data.longitude,
 
-            responder[
-                "latitude"
-            ],
-
-            responder[
-                "longitude"
-            ]
+            responder["latitude"],
+            responder["longitude"]
         )
-
 
         nearby.append({
 
@@ -246,14 +472,10 @@ async def create_incident(
                 ],
 
             "name":
-                responder[
-                    "name"
-                ],
+                responder["name"],
 
             "type":
-                responder[
-                    "responder_type"
-                ],
+                responder["responder_type"],
 
             "distance_km":
                 round(
@@ -264,15 +486,19 @@ async def create_incident(
 
 
     nearby.sort(
-        key=lambda x:
-        x["distance_km"]
+        key=lambda item:
+        item["distance_km"]
     )
+
+    connection.close()
 
 
     return {
 
         "incident":
-            incident,
+            row_to_dict(
+                incident
+            ),
 
         "nearby_responders":
             nearby[:5]
@@ -280,19 +506,32 @@ async def create_incident(
 
 
 # ============================================================
-# GET INCIDENTS
+# GET ALL INCIDENTS
 # ============================================================
 
 @app.get("/api/incidents")
 def get_incidents():
 
-    return list(
-        incidents.values()
-    )
+    connection = get_db()
+
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM incidents
+        ORDER BY id DESC
+        """
+    ).fetchall()
+
+    connection.close()
+
+    return [
+        row_to_dict(row)
+        for row in rows
+    ]
 
 
 # ============================================================
-# GET ONE INCIDENT
+# GET INCIDENT
 # ============================================================
 
 @app.get(
@@ -302,68 +541,151 @@ def get_incident(
     incident_id: str
 ):
 
-    if incident_id not in incidents:
+    connection = get_db()
+
+    row = connection.execute(
+        """
+        SELECT *
+        FROM incidents
+        WHERE incident_id = ?
+        """,
+        (incident_id,)
+    ).fetchone()
+
+    connection.close()
+
+    if row is None:
 
         raise HTTPException(
             status_code=404,
             detail="Incident not found"
         )
 
-    return incidents[
-        incident_id
-    ]
+    return row_to_dict(row)
 
 
 # ============================================================
 # REGISTER RESPONDER
 # ============================================================
 
-@app.post("/api/responders/register")
+@app.post(
+    "/api/responders/register"
+)
 def register_responder(
     data: ResponderCreate
 ):
 
+    connection = get_db()
+
     responder_id = (
-        f"RESP-{len(responders) + 1:04d}"
+        next_responder_id(
+            connection
+        )
     )
 
+    timestamp = now_utc()
 
-    responder = {
-
-        "responder_id":
+    connection.execute(
+        """
+        INSERT INTO responders (
             responder_id,
-
-        "name":
+            name,
+            responder_type,
+            latitude,
+            longitude,
+            status,
+            phone,
+            registered_at,
+            last_seen
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            responder_id,
             data.name,
-
-        "responder_type":
             data.responder_type,
-
-        "latitude":
             data.latitude,
-
-        "longitude":
             data.longitude,
-
-        "phone":
-            data.phone,
-
-        "status":
             "AVAILABLE",
+            data.phone,
+            timestamp,
+            timestamp
+        )
+    )
 
-        "registered_at":
-            datetime.now(
-                timezone.utc
-            ).isoformat()
-    }
+    connection.commit()
+
+    row = connection.execute(
+        """
+        SELECT *
+        FROM responders
+        WHERE responder_id = ?
+        """,
+        (responder_id,)
+    ).fetchone()
+
+    connection.close()
+
+    return row_to_dict(row)
 
 
-    responders[
-        responder_id
-    ] = responder
+# ============================================================
+# GET RESPONDER
+# ============================================================
+
+@app.get(
+    "/api/responders/{responder_id}"
+)
+def get_responder(
+    responder_id: str
+):
+
+    connection = get_db()
+
+    row = connection.execute(
+        """
+        SELECT *
+        FROM responders
+        WHERE responder_id = ?
+        """,
+        (responder_id,)
+    ).fetchone()
+
+    connection.close()
+
+    if row is None:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Responder not found"
+        )
+
+    return row_to_dict(row)
 
 
-    return responder
+# ============================================================
+# GET ALL RESPONDERS
+# ============================================================
+
+@app.get("/api/responders")
+def get_responders():
+
+    connection = get_db()
+
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM responders
+        ORDER BY id DESC
+        """
+    ).fetchall()
+
+    connection.close()
+
+    return [
+        row_to_dict(row)
+        for row in rows
+    ]
 
 
 # ============================================================
@@ -378,7 +700,20 @@ def update_location(
     data: LocationUpdate
 ):
 
-    if responder_id not in responders:
+    connection = get_db()
+
+    existing = connection.execute(
+        """
+        SELECT responder_id
+        FROM responders
+        WHERE responder_id = ?
+        """,
+        (responder_id,)
+    ).fetchone()
+
+    if existing is None:
+
+        connection.close()
 
         raise HTTPException(
             status_code=404,
@@ -386,18 +721,66 @@ def update_location(
         )
 
 
-    responders[
-        responder_id
-    ]["latitude"] = data.latitude
-
-    responders[
-        responder_id
-    ]["longitude"] = data.longitude
+    timestamp = now_utc()
 
 
-    return responders[
-        responder_id
-    ]
+    connection.execute(
+        """
+        UPDATE responders
+
+        SET
+            latitude = ?,
+            longitude = ?,
+            last_seen = ?
+
+        WHERE responder_id = ?
+        """,
+        (
+            data.latitude,
+            data.longitude,
+            timestamp,
+            responder_id
+        )
+    )
+
+
+    connection.execute(
+        """
+        INSERT INTO location_history (
+            responder_id,
+            latitude,
+            longitude,
+            accuracy,
+            timestamp
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            responder_id,
+            data.latitude,
+            data.longitude,
+            data.accuracy,
+            timestamp
+        )
+    )
+
+
+    connection.commit()
+
+
+    row = connection.execute(
+        """
+        SELECT *
+        FROM responders
+        WHERE responder_id = ?
+        """,
+        (responder_id,)
+    ).fetchone()
+
+
+    connection.close()
+
+    return row_to_dict(row)
 
 
 # ============================================================
@@ -412,22 +795,14 @@ def update_status(
     data: StatusUpdate
 ):
 
-    if responder_id not in responders:
-
-        raise HTTPException(
-            status_code=404,
-            detail="Responder not found"
-        )
-
-
     allowed = {
 
         "AVAILABLE",
         "BUSY",
-        "OFFLINE",
-        "EN_ROUTE"
+        "ALERTED",
+        "EN_ROUTE",
+        "OFFLINE"
     }
-
 
     if data.status not in allowed:
 
@@ -435,19 +810,67 @@ def update_status(
             status_code=400,
             detail=(
                 "Invalid status. "
-                f"Allowed: {allowed}"
+                f"Allowed: {sorted(allowed)}"
             )
         )
 
 
-    responders[
-        responder_id
-    ]["status"] = data.status
+    connection = get_db()
+
+    row = connection.execute(
+        """
+        SELECT *
+        FROM responders
+        WHERE responder_id = ?
+        """,
+        (responder_id,)
+    ).fetchone()
 
 
-    return responders[
-        responder_id
-    ]
+    if row is None:
+
+        connection.close()
+
+        raise HTTPException(
+            status_code=404,
+            detail="Responder not found"
+        )
+
+
+    connection.execute(
+        """
+        UPDATE responders
+
+        SET
+            status = ?,
+            last_seen = ?
+
+        WHERE responder_id = ?
+        """,
+        (
+            data.status,
+            now_utc(),
+            responder_id
+        )
+    )
+
+
+    connection.commit()
+
+
+    updated = connection.execute(
+        """
+        SELECT *
+        FROM responders
+        WHERE responder_id = ?
+        """,
+        (responder_id,)
+    ).fetchone()
+
+
+    connection.close()
+
+    return row_to_dict(updated)
 
 
 # ============================================================
@@ -461,7 +884,22 @@ def dispatch_incident(
     incident_id: str
 ):
 
-    if incident_id not in incidents:
+    connection = get_db()
+
+
+    incident = connection.execute(
+        """
+        SELECT *
+        FROM incidents
+        WHERE incident_id = ?
+        """,
+        (incident_id,)
+    ).fetchone()
+
+
+    if incident is None:
+
+        connection.close()
 
         raise HTTPException(
             status_code=404,
@@ -469,40 +907,27 @@ def dispatch_incident(
         )
 
 
-    incident = incidents[
-        incident_id
-    ]
+    responders_rows = connection.execute(
+        """
+        SELECT *
+        FROM responders
+        WHERE status = 'AVAILABLE'
+        """
+    ).fetchall()
 
 
     nearby = []
 
 
-    for responder in responders.values():
-
-        if responder[
-            "status"
-        ] != "AVAILABLE":
-
-            continue
-
+    for responder in responders_rows:
 
         distance = haversine_km(
 
-            incident[
-                "latitude"
-            ],
+            incident["latitude"],
+            incident["longitude"],
 
-            incident[
-                "longitude"
-            ],
-
-            responder[
-                "latitude"
-            ],
-
-            responder[
-                "longitude"
-            ]
+            responder["latitude"],
+            responder["longitude"]
         )
 
 
@@ -514,9 +939,7 @@ def dispatch_incident(
                 ],
 
             "name":
-                responder[
-                    "name"
-                ],
+                responder["name"],
 
             "type":
                 responder[
@@ -537,11 +960,9 @@ def dispatch_incident(
     )
 
 
-    # --------------------------------------------------------
-    # DEMO DISPATCH
-    # --------------------------------------------------------
-
     selected = nearby[:3]
+
+    timestamp = now_utc()
 
 
     for responder in selected:
@@ -553,9 +974,47 @@ def dispatch_incident(
         )
 
 
-        responders[
-            responder_id
-        ]["status"] = "ALERTED"
+        connection.execute(
+            """
+            UPDATE responders
+
+            SET
+                status = 'ALERTED',
+                last_seen = ?
+
+            WHERE responder_id = ?
+            """,
+            (
+                timestamp,
+                responder_id
+            )
+        )
+
+
+        connection.execute(
+            """
+            INSERT INTO dispatches (
+                incident_id,
+                responder_id,
+                status,
+                sent_at,
+                accepted_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                incident_id,
+                responder_id,
+                "SENT",
+                timestamp,
+                None
+            )
+        )
+
+
+    connection.commit()
+
+    connection.close()
 
 
     return {
@@ -583,7 +1042,32 @@ def accept_incident(
     responder_id: str
 ):
 
-    if incident_id not in incidents:
+    connection = get_db()
+
+
+    incident = connection.execute(
+        """
+        SELECT *
+        FROM incidents
+        WHERE incident_id = ?
+        """,
+        (incident_id,)
+    ).fetchone()
+
+
+    responder = connection.execute(
+        """
+        SELECT *
+        FROM responders
+        WHERE responder_id = ?
+        """,
+        (responder_id,)
+    ).fetchone()
+
+
+    if incident is None:
+
+        connection.close()
 
         raise HTTPException(
             status_code=404,
@@ -591,7 +1075,9 @@ def accept_incident(
         )
 
 
-    if responder_id not in responders:
+    if responder is None:
+
+        connection.close()
 
         raise HTTPException(
             status_code=404,
@@ -599,50 +1085,198 @@ def accept_incident(
         )
 
 
-    incident = incidents[
-        incident_id
-    ]
+    # --------------------------------------------------------
+    # Prevent two responders from accepting simultaneously.
+    # --------------------------------------------------------
 
-    responder = responders[
-        responder_id
-    ]
+    if incident[
+        "assigned_responder"
+    ] is not None:
 
-
-    if responder[
-        "status"
-    ] not in {
-        "ALERTED",
-        "AVAILABLE"
-    }:
+        connection.close()
 
         raise HTTPException(
             status_code=409,
-            detail="Responder unavailable"
+            detail=(
+                "Incident already assigned."
+            )
         )
 
 
-    incident[
-        "assigned_responder"
-    ] = responder_id
-
-    incident[
+    current_status = responder[
         "status"
-    ] = "RESPONDER_ASSIGNED"
+    ]
 
 
-    responder[
-        "status"
-    ] = "EN_ROUTE"
+    if current_status not in {
+        "AVAILABLE",
+        "ALERTED"
+    }:
+
+        connection.close()
+
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Responder is unavailable."
+            )
+        )
+
+
+    accepted_at = now_utc()
+
+
+    # --------------------------------------------------------
+    # ASSIGN INCIDENT
+    # --------------------------------------------------------
+
+    connection.execute(
+        """
+        UPDATE incidents
+
+        SET
+            assigned_responder = ?,
+            status = 'RESPONDER_ASSIGNED'
+
+        WHERE incident_id = ?
+        """,
+        (
+            responder_id,
+            incident_id
+        )
+    )
+
+
+    connection.execute(
+        """
+        UPDATE responders
+
+        SET
+            status = 'EN_ROUTE',
+            last_seen = ?
+
+        WHERE responder_id = ?
+        """,
+        (
+            accepted_at,
+            responder_id
+        )
+    )
+
+
+    connection.execute(
+        """
+        UPDATE dispatches
+
+        SET
+            status = 'ACCEPTED',
+            accepted_at = ?
+
+        WHERE incident_id = ?
+        AND responder_id = ?
+        AND status = 'SENT'
+        """,
+        (
+            accepted_at,
+            incident_id,
+            responder_id
+        )
+    )
+
+
+    connection.commit()
+
+
+    updated_incident = connection.execute(
+        """
+        SELECT *
+        FROM incidents
+        WHERE incident_id = ?
+        """,
+        (incident_id,)
+    ).fetchone()
+
+
+    updated_responder = connection.execute(
+        """
+        SELECT *
+        FROM responders
+        WHERE responder_id = ?
+        """,
+        (responder_id,)
+    ).fetchone()
+
+
+    connection.close()
 
 
     return {
 
         "incident":
-            incident,
+            row_to_dict(
+                updated_incident
+            ),
 
         "responder":
-            responder
+            row_to_dict(
+                updated_responder
+            )
     }
+
+
+# ============================================================
+# LOCATION HISTORY
+# ============================================================
+
+@app.get(
+    "/api/responders/{responder_id}/location-history"
+)
+def get_location_history(
+    responder_id: str,
+    limit: int = 100
+):
+
+    limit = max(
+        1,
+        min(
+            limit,
+            1000
+        )
+    )
+
+
+    connection = get_db()
+
+    rows = connection.execute(
+        """
+        SELECT
+            latitude,
+            longitude,
+            accuracy,
+            timestamp
+
+        FROM location_history
+
+        WHERE responder_id = ?
+
+        ORDER BY id DESC
+
+        LIMIT ?
+        """,
+        (
+            responder_id,
+            limit
+        )
+    ).fetchall()
+
+
+    connection.close()
+
+
+    return [
+        row_to_dict(row)
+        for row in rows
+    ]
 
 
 # ============================================================
@@ -659,11 +1293,6 @@ async def responder_socket(
 
     await websocket.accept()
 
-    connections[
-        responder_id
-    ] = websocket
-
-
     try:
 
         while True:
@@ -674,25 +1303,10 @@ async def responder_socket(
 
         pass
 
-    finally:
-
-        connections.pop(
-            responder_id,
-            None
-        )
-
 
 # ============================================================
-# RUN
+# START
 # ============================================================
-@app.get("/responder")
-def responder_page():
-
-    return FileResponse(
-        "responder.html"
-    )
-
-
 
 if __name__ == "__main__":
 
@@ -701,6 +1315,5 @@ if __name__ == "__main__":
     uvicorn.run(
         "app:app",
         host="0.0.0.0",
-        port=8000,
-        reload=True
+        port=8000
     )

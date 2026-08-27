@@ -3,10 +3,12 @@ import time
 import joblib
 import numpy as np
 import pandas as pd
+import asyncio
 
 from collections import deque
-
 from ultralytics import YOLO
+
+from routing_service import get_route, RoutingError
 
 from accident_logic import (
     update_vehicle,
@@ -44,12 +46,8 @@ VEHICLE_CLASSES = [2, 3, 5, 7]
 
 ML_THRESHOLD = 0.50
 
-# Number of suspicious temporal windows required
-# inside one event.
 MIN_SUSPICIOUS_WINDOWS = 2
 
-# Maximum time gap between suspicious windows
-# before they are considered separate events.
 EVENT_GAP_SECONDS = 1.5
 
 
@@ -64,9 +62,7 @@ ALERT_DURATION = 5
 # DISPLAY
 # ------------------------------------------------------------
 
-WINDOW_NAME = (
-    "ResQTrack - Accident Detection"
-)
+WINDOW_NAME = "ResQTrack - Accident Detection"
 
 
 # ============================================================
@@ -79,13 +75,9 @@ print("          RESQTRACK FINAL LIVE SYSTEM")
 print("============================================================")
 print()
 
-print(
-    "Loading final temporal model..."
-)
+print("Loading final temporal model...")
 
-package = joblib.load(
-    FINAL_MODEL
-)
+package = joblib.load(FINAL_MODEL)
 
 final_model = package["model"]
 
@@ -275,9 +267,7 @@ while True:
 
     if (
         result.boxes is not None
-
         and
-
         result.boxes.id is not None
     ):
 
@@ -383,6 +373,7 @@ while True:
 
 
     # Keep only enough history for one temporal window.
+
     if len(frame_features) > WINDOW_FRAMES:
 
         frame_features = (
@@ -420,9 +411,11 @@ while True:
 
 
     stride_ready = (
+
         frame_number
         >=
         WINDOW_FRAMES
+
         and
 
         (
@@ -440,11 +433,17 @@ while True:
 
 
     if (
+
         window_ready
+
         and
+
         stride_ready
+
         and
+
         not accident_active
+
     ):
 
 
@@ -469,11 +468,13 @@ while True:
             model_input = pd.DataFrame(
 
                 [[
+
                     aggregated[
                         feature
                     ]
 
                     for feature in FEATURES
+
                 ]],
 
                 columns=FEATURES
@@ -487,7 +488,9 @@ while True:
             probability = float(
 
                 final_model.predict_proba(
+
                     model_input
+
                 )[0][1]
             )
 
@@ -498,7 +501,9 @@ while True:
 
 
             max_probability = max(
+
                 max_probability,
+
                 probability
             )
 
@@ -517,9 +522,12 @@ while True:
 
             if latest_prediction == 1:
 
+
                 suspicious_window_count += 1
 
+
                 current_time = (
+
                     frame_number
                     /
                     fps
@@ -527,6 +535,7 @@ while True:
 
 
                 suspicious_events.append(
+
                     current_time
                 )
 
@@ -542,13 +551,16 @@ while True:
                     and
 
                     (
+
                         current_time
                         -
                         suspicious_events[0]
+
                     )
 
                     >
                     EVENT_GAP_SECONDS
+
                 ):
 
                     suspicious_events.popleft()
@@ -563,15 +575,21 @@ while True:
                     len(
                         suspicious_events
                     )
+
                     >=
+
                     MIN_SUSPICIOUS_WINDOWS
+
                 ):
 
+
                     accident_active = True
+
 
                     accident_start_time = (
                         time.time()
                     )
+
 
                     confirmation_frame = (
                         frame_number
@@ -579,47 +597,191 @@ while True:
 
 
                     print()
+
+
                     print(
                         "================================================"
                     )
+
 
                     print(
                         "🚨 ACCIDENT CONFIRMED"
                     )
 
-                    print(
-                        "Frame:",
-                        frame_number
-                    )
 
-                    print(
-                        "ML Probability:",
-                        round(
-                            probability,
-                            4
+                    # ====================================================
+                    # ROUTING AFTER ACCIDENT CONFIRMATION
+                    #
+                    # TEMPORARY TEST COORDINATES
+                    #
+                    # Accident:
+                    # 12.653738, 77.446470
+                    #
+                    # Hospital / Destination:
+                    # 12.861730, 77.529955
+                    #
+                    # These will later be replaced with the actual
+                    # accident and hospital coordinates.
+                    # ====================================================
+
+                    try:
+
+
+                        route_result = asyncio.run(
+
+                            get_route(
+
+                                start_lat=12.653738,
+
+                                start_lon=77.446470,
+
+                                end_lat=12.861730,
+
+                                end_lon=77.529955
+
+                            )
                         )
-                    )
+
+
+                        print()
+
+
+                        print(
+                            "================================================"
+                        )
+
+
+                        print(
+                            "🚑 EMERGENCY ROUTE"
+                        )
+
+
+                        print(
+                            "================================================"
+                        )
+
+
+                        print(
+
+                            "Distance:",
+
+                            route_result[
+                                "distance_km"
+                            ],
+
+                            "km"
+
+                        )
+
+
+                        print(
+
+                            "ETA:",
+
+                            route_result[
+                                "duration_minutes"
+                            ],
+
+                            "minutes"
+
+                        )
+
+
+                        print(
+
+                            "Routing Engine:",
+
+                            "OSRM"
+
+                        )
+
+
+                        print(
+
+                            "================================================"
+                        )
+
+
+                        print()
+
+
+                    except RoutingError as error:
+
+
+                        print()
+
+
+                        print(
+                            "⚠️ ROUTING ERROR:"
+                        )
+
+
+                        print(
+                            error
+                        )
+
+
+                        print()
+
 
                     print(
+
+                        "Frame:",
+
+                        frame_number
+
+                    )
+
+
+                    print(
+
+                        "ML Probability:",
+
+                        round(
+
+                            probability,
+
+                            4
+
+                        )
+
+                    )
+
+
+                    print(
+
                         "Physical Score:",
+
                         physical_score
+
                     )
 
+
                     print(
+
                         "Collision Pairs:",
+
                         collision_pairs
+
                     )
 
+
                     print(
+
                         "Suspicious Windows:",
+
                         len(
                             suspicious_events
                         )
+
                     )
 
+
                     print(
+
                         "================================================"
                     )
+
 
                     print()
 
@@ -630,25 +792,37 @@ while True:
 
     if accident_active:
 
+
         elapsed = (
+
             time.time()
+
             -
+
             accident_start_time
+
         )
 
 
         if elapsed >= ALERT_DURATION:
 
+
             accident_active = False
+
 
             confirmation_frame = None
 
+
             suspicious_events.clear()
+
 
             suspicious_window_count = 0
 
+
             print(
+
                 "Accident alert cleared."
+
             )
 
 
@@ -657,7 +831,9 @@ while True:
     # ========================================================
 
     annotated_frame = (
+
         result.plot()
+
     )
 
 
@@ -680,6 +856,7 @@ while True:
         (255, 255, 0),
 
         2
+
     )
 
 
@@ -702,6 +879,7 @@ while True:
         (255, 255, 0),
 
         2
+
     )
 
 
@@ -714,9 +892,13 @@ while True:
         annotated_frame,
 
         (
+
             f"Suspicious Windows: "
+
             f"{len(suspicious_events)}/"
+
             f"{MIN_SUSPICIOUS_WINDOWS}"
+
         ),
 
         (25, 95),
@@ -728,6 +910,7 @@ while True:
         (255, 255, 0),
 
         2
+
     )
 
 
@@ -736,6 +919,7 @@ while True:
     # ========================================================
 
     if accident_active:
+
 
         cv2.putText(
 
@@ -752,10 +936,12 @@ while True:
             (0, 0, 255),
 
             3
+
         )
 
 
     elif latest_probability >= ML_THRESHOLD:
+
 
         cv2.putText(
 
@@ -772,10 +958,12 @@ while True:
             (0, 165, 255),
 
             2
+
         )
 
 
     else:
+
 
         cv2.putText(
 
@@ -792,6 +980,7 @@ while True:
             (0, 255, 0),
 
             3
+
         )
 
 
@@ -804,6 +993,7 @@ while True:
         WINDOW_NAME,
 
         annotated_frame
+
     )
 
 
@@ -812,9 +1002,13 @@ while True:
     # ========================================================
 
     key = (
+
         cv2.waitKey(1)
+
         &
+
         0xFF
+
     )
 
 
@@ -835,21 +1029,32 @@ reset_vehicle_history()
 
 
 print()
+
+
 print(
     "============================================================"
 )
+
 
 print(
     "ResQTrack stopped."
 )
 
+
 print(
+
     "Maximum ML probability:",
+
     round(
+
         max_probability,
+
         4
+
     )
+
 )
+
 
 print(
     "============================================================"

@@ -1,0 +1,22 @@
+# ResQTrack - SIH 2026
+# ------------------------------------------------------------------
+# Install with:  pip install -r requirements.txt
+# ------------------------------------------------------------------
+
+# --- Computer vision / detection ---
+ultralytics>=8.3.0          # YOLO11 + ByteTrack
+opencv-python>=4.9.0        # video IO + HUD rendering
+numpy>=1.26.0
+pandas>=2.1.0
+lap>=0.5.12                 # ByteTrack assignment solver
+
+# --- Trained temporal model ---
+scikit-learn>=1.4.0
+joblib>=1.3.0
+
+# --- Emergency response backend ---
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0   # includes websockets
+httpx>=0.27.0
+pydantic>=2.6.0
+python-multipart>=0.0.9     # snapshot upload

@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14">
+<title>ResQTrack Responder</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#141b24; --panel-2:#1b232e; --line:#26303d;
+    --text:#e8edf3; --muted:#8b97a8; --accent:#22c55e; --accent-2:#38bdf8;
+    --danger:#ef4444; --warn:#f59e0b; --critical:#dc2626;
+  }
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
+  body{margin:0; background:var(--bg); color:var(--text);
+       font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  .wrap{max-width:520px; margin:0 auto; padding:14px 14px 90px}
+  header{display:flex; align-items:center; gap:10px; padding:6px 2px 14px}
+  .logo{width:38px;height:38px;border-radius:11px;background:linear-gradient(135deg,#ef4444,#f97316);
+        display:grid;place-items:center;font-size:20px}
+  header h1{margin:0;font-size:19px;letter-spacing:.2px}
+  header p{margin:0;font-size:12px;color:var(--muted)}
+  .live{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)}
+  .dot{width:8px;height:8px;border-radius:50%;background:#64748b}
+  .dot.on{background:var(--accent);box-shadow:0 0 8px var(--accent)}
+  .dot.off{background:var(--danger)}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:16px;margin-bottom:12px}
+  .card h2{margin:0 0 12px;font-size:14px;text-transform:uppercase;letter-spacing:.9px;color:var(--muted)}
+  label{display:block;font-size:12px;color:var(--muted);margin:10px 0 5px}
+  input,select{width:100%;padding:12px;border-radius:10px;border:1px solid var(--line);
+        background:var(--panel-2);color:var(--text);font-size:15px}
+  button{width:100%;padding:14px;border:0;border-radius:12px;font-size:15px;font-weight:600;
+        background:var(--accent-2);color:#04121c;cursor:pointer;margin-top:12px}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button.ghost{background:var(--panel-2);color:var(--text);border:1px solid var(--line)}
+  button.danger{background:var(--danger);color:#fff}
+  button.go{background:var(--accent);color:#05210f}
+  .row{display:flex;gap:8px}
+  .row>button{margin-top:0}
+  .hidden{display:none !important}
+
+  .status{border-radius:14px;padding:14px;text-align:center;font-weight:700;letter-spacing:.6px;margin-bottom:12px}
+  .s-available{background:rgba(34,197,94,.14);color:#4ade80;border:1px solid rgba(34,197,94,.35)}
+  .s-alerted{background:rgba(239,68,68,.16);color:#f87171;border:1px solid rgba(239,68,68,.4);
+             animation:pulse 1s infinite}
+  .s-enroute{background:rgba(56,189,248,.14);color:#7dd3fc;border:1px solid rgba(56,189,248,.35)}
+  .s-scene{background:rgba(245,158,11,.14);color:#fbbf24;border:1px solid rgba(245,158,11,.35)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
+
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:7px 12px;font-size:13px}
+  .kv dt{color:var(--muted)}
+  .kv dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}
+
+  .sev{display:inline-block;padding:3px 9px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.5px}
+  .sev.CRITICAL{background:var(--critical);color:#fff}
+  .sev.HIGH{background:#ea580c;color:#fff}
+  .sev.MODERATE{background:var(--warn);color:#221602}
+  .sev.LOW{background:#475569;color:#e2e8f0}
+
+  #map{height:290px;border-radius:14px;border:1px solid var(--line);margin-bottom:12px;background:var(--panel-2)}
+  .maphint{font-size:12px;color:var(--muted);text-align:center;padding:26px 12px}
+
+  .steps{max-height:210px;overflow-y:auto;margin:0;padding:0;list-style:none}
+  .steps li{padding:10px 0;border-bottom:1px solid var(--line);display:flex;gap:11px;align-items:flex-start}
+  .steps li:last-child{border-bottom:0}
+  .steps .ic{width:26px;height:26px;flex:0 0 26px;border-radius:8px;background:var(--panel-2);
+             display:grid;place-items:center;font-size:13px}
+  .steps .tx{flex:1;font-size:13px}
+  .steps .di{font-size:11px;color:var(--muted);white-space:nowrap}
+  .steps li.done{opacity:.4}
+
+  .facility{display:flex;gap:11px;align-items:center;padding:12px;border:1px solid var(--line);
+            border-radius:12px;margin-bottom:9px;cursor:pointer;background:var(--panel-2)}
+  .facility:active{border-color:var(--accent-2)}
+  .facility .n{flex:1;min-width:0}
+  .facility .n b{display:block;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .facility .n span{font-size:11px;color:var(--muted)}
+  .facility .m{text-align:right;font-size:12px;white-space:nowrap}
+  .facility .m b{color:var(--accent-2);display:block;font-size:15px}
+  .er{font-size:10px;background:rgba(239,68,68,.2);color:#fca5a5;padding:2px 6px;border-radius:5px;margin-left:5px}
+
+  .toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);background:var(--panel-2);
+         border:1px solid var(--line);padding:11px 16px;border-radius:11px;font-size:13px;
+         box-shadow:0 10px 30px rgba(0,0,0,.5);z-index:60;max-width:92vw}
+
+  /* alert takeover */
+  .alert-screen{position:fixed;inset:0;background:rgba(6,9,13,.97);z-index:100;
+       display:flex;flex-direction:column;padding:22px;overflow-y:auto}
+  .alert-screen .halo{position:absolute;inset:0;border:8px solid var(--danger);
+       animation:flash .85s infinite;pointer-events:none}
+  @keyframes flash{0%,100%{opacity:.85}50%{opacity:.2}}
+  .alert-inner{margin:auto;width:100%;max-width:460px;position:relative;z-index:2}
+  .alert-inner h2{font-size:13px;letter-spacing:2px;color:#f87171;margin:0 0 6px;text-align:center}
+  .alert-inner h3{font-size:25px;margin:0 0 4px;text-align:center;line-height:1.25}
+  .alert-inner .loc{text-align:center;color:var(--muted);font-size:13px;margin-bottom:16px}
+  .alert-inner img{width:100%;border-radius:12px;border:1px solid var(--line);margin-bottom:14px}
+  .ev{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}
+  .ev span{font-size:11px;padding:3px 9px;border:1px solid var(--line);border-radius:999px;color:var(--muted)}
+  .big{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:14px 0}
+  .big div{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px;text-align:center}
+  .big b{display:block;font-size:23px;color:var(--accent-2)}
+  .big span{font-size:11px;color:var(--muted)}
+
+  .tabs{display:flex;gap:6px;margin-bottom:12px}
+  .tabs button{margin:0;padding:9px;font-size:13px;background:var(--panel-2);color:var(--muted);border:1px solid var(--line)}
+  .tabs button.active{background:var(--accent-2);color:#04121c;border-color:var(--accent-2)}
+  .hist{font-size:13px;border-bottom:1px solid var(--line);padding:10px 0}
+  .hist b{display:block}
+  .hist span{color:var(--muted);font-size:11px}
+  .muted{color:var(--muted);font-size:12px}
+  .banner{background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.3);color:#fbbf24;
+          padding:9px 12px;border-radius:10px;font-size:12px;margin-bottom:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="logo">🚑</div>
+    <div>
+      <h1>ResQTrack Responder</h1>
+      <p id="subtitle">Emergency response unit</p>
+    </div>
+    <div class="live"><span class="dot" id="wsDot"></span><span id="wsText">offline</span></div>
+  </header>
+
+  <div id="offlineBanner" class="banner hidden"></div>
+
+  <!-- ============ REGISTRATION ============ -->
+  <section id="registerCard" class="card">
+    <h2>Sign on for duty</h2>
+    <label for="rName">Responder / crew name</label>
+    <input id="rName" placeholder="Ambulance 108 - Unit C" autocomplete="off">
+    <label for="rType">Unit type</label>
+    <select id="rType">
+      <option value="AMBULANCE">Ambulance</option>
+      <option value="PARAMEDIC">Paramedic (bike)</option>
+      <option value="POLICE">Traffic police</option>
+      <option value="FIRE">Fire and rescue</option>
+      <option value="TOW">Recovery / tow</option>
+    </select>
+    <label for="rPhone">Contact number</label>
+    <input id="rPhone" placeholder="+91 ..." autocomplete="off">
+    <label for="rVehicle">Vehicle number</label>
+    <input id="rVehicle" placeholder="KA-01-EA-1108" autocomplete="off">
+
+    <div id="gpsBox" class="card" style="margin:14px 0 0;background:var(--panel-2)">
+      <dl class="kv">
+        <dt>GPS</dt><dd id="gpsState">not acquired</dd>
+        <dt>Latitude</dt><dd id="gpsLat">--</dd>
+        <dt>Longitude</dt><dd id="gpsLon">--</dd>
+        <dt>Accuracy</dt><dd id="gpsAcc">--</dd>
+      </dl>
+    </div>
+    <button id="btnLocate" class="ghost">Get my location</button>
+    <button id="btnRegister" disabled>Go on duty</button>
+    <p class="muted" id="regMsg" style="margin-top:10px"></p>
+  </section>
+
+  <!-- ============ ON DUTY ============ -->
+  <section id="dutyPanel" class="hidden">
+    <div id="statusBox" class="status s-available">AVAILABLE</div>
+
+    <div class="tabs">
+      <button id="tabNow" class="active">Current</button>
+      <button id="tabHistory">My history</button>
+    </div>
+
+    <div id="viewNow">
+      <div class="card">
+        <h2>Unit</h2>
+        <dl class="kv">
+          <dt>ID</dt><dd id="myId">--</dd>
+          <dt>Name</dt><dd id="myName">--</dd>
+          <dt>Position</dt><dd id="myPos">--</dd>
+          <dt>Last fix</dt><dd id="myFix">--</dd>
+        </dl>
+        <button id="btnOffDuty" class="ghost">Go off duty</button>
+      </div>
+
+      <!-- assignment -->
+      <section id="jobCard" class="card hidden">
+        <h2>Active call <span id="jobId" style="float:right;color:var(--accent-2)"></span></h2>
+        <h3 id="jobLabel" style="margin:0 0 4px;font-size:18px"></h3>
+        <p id="jobLoc" class="muted" style="margin:0 0 10px"></p>
+        <div id="jobSeverity"></div>
+        <img id="jobShot" class="hidden" style="width:100%;border-radius:12px;margin:12px 0;border:1px solid var(--line)">
+        <div class="big">
+          <div><b id="jobDist">--</b><span id="jobDistLabel">km to scene</span></div>
+          <div><b id="jobEta">--</b><span>min ETA</span></div>
+        </div>
+        <div id="map"><div class="maphint" id="mapHint">Map loads when the route is ready.</div></div>
+        <div id="trafficNote" class="muted" style="margin-bottom:10px"></div>
+        <h2 id="stepsTitle">Turn-by-turn</h2>
+        <ul class="steps" id="stepList"></ul>
+        <button id="btnArrived" class="go">I have reached the scene</button>
+        <button id="btnHospitals" class="hidden">Find nearby hospitals</button>
+        <button id="btnComplete" class="hidden ghost">Close this case</button>
+        <button id="btnCall" class="hidden ghost">Call control room</button>
+      </section>
+
+      <!-- hospitals -->
+      <section id="hospitalCard" class="card hidden">
+        <h2>Receiving facility</h2>
+        <p class="muted" id="hospitalNote">Ranked by road travel time from the scene.</p>
+        <div id="hospitalList"></div>
+        <button id="btnRefreshHospitals" class="ghost">Search a wider area</button>
+      </section>
+
+      <section id="idleCard" class="card">
+        <h2>Standing by</h2>
+        <p class="muted">You will receive an emergency alert the moment a camera
+        confirms an accident near you. Keep this screen open.</p>
+      </section>
+    </div>
+
+    <div id="viewHistory" class="hidden">
+      <div class="card">
+        <h2>My completed calls</h2>
+        <div id="historyList"><p class="muted">No calls yet.</p></div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- ============ INCOMING ALERT ============ -->
+<div id="alertScreen" class="alert-screen hidden">
+  <div class="halo"></div>
+  <div class="alert-inner">
+    <h2>EMERGENCY DISPATCH</h2>
+    <h3 id="alLabel">Accident confirmed</h3>
+    <p class="loc" id="alLoc"></p>
+    <div style="text-align:center;margin-bottom:12px"><span id="alSev" class="sev"></span></div>
+    <img id="alShot" class="hidden" alt="scene">
+    <div class="big">
+      <div><b id="alDist">--</b><span>km away</span></div>
+      <div><b id="alEta">--</b><span>min ETA</span></div>
+    </div>
+    <dl class="kv">
+      <dt>Incident</dt><dd id="alId"></dd>
+      <dt>Camera</dt><dd id="alCam"></dd>
+      <dt>Confidence</dt><dd id="alConf"></dd>
+      <dt>Detected</dt><dd id="alTime"></dd>
+    </dl>
+    <div class="ev" id="alEvidence"></div>
+    <p class="muted" id="alReason" style="margin:0 0 6px"></p>
+    <button id="btnAccept" class="go">ACCEPT AND RESPOND</button>
+    <button id="btnDecline" class="danger">Cannot respond</button>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+/* ============================================================
+   ResQTrack responder client
+   Real-time over WebSocket; every REST call is a fallback path.
+   ============================================================ */
+const API = location.origin;
+const S = {
+  responder: null, incident: null, route: null, socket: null,
+  map: null, layers: {}, watchId: null, alert: null, lastSteps: [], hospitals: []
+};
+
+const $ = id => document.getElementById(id);
+const fmt = n => (n === null || n === undefined || isNaN(n)) ? "--" : Number(n).toFixed(1);
+
+function toast(msg, ms = 3200){
+  const el = document.createElement("div");
+  el.className = "toast"; el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), ms);
+}
+
+function banner(msg){
+  const b = $("offlineBanner");
+  if(!msg){ b.classList.add("hidden"); return; }
+  b.textContent = msg; b.classList.remove("hidden");
+}
+
+async function api(path, options){
+  const response = await fetch(API + path, {
+    headers: {"Content-Type": "application/json"}, ...options
+  });
+  if(!response.ok){
+    let detail = response.statusText;
+    try { detail = (await response.json()).detail || detail; } catch(e){}
+    throw new Error(detail);
+  }
+  return response.json();
+}
+
+/* ---------- audible + haptic alarm ---------- */
+let audioCtx = null, sirenTimer = null;
+function startSiren(){
+  try{
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if(audioCtx.state === "suspended") audioCtx.resume();
+    let high = true;
+    const beep = () => {
+      const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = high ? 880 : 620; high = !high;
+      gain.gain.setValueAtTime(0.0001, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.28, audioCtx.currentTime + 0.05);
+      gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.45);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start(); osc.stop(audioCtx.currentTime + 0.5);
+    };
+    beep(); sirenTimer = setInterval(beep, 550);
+  }catch(e){ /* audio is a nicety, never a blocker */ }
+  if(navigator.vibrate) navigator.vibrate([300,120,300,120,600]);
+}
+function stopSiren(){ if(sirenTimer){ clearInterval(sirenTimer); sirenTimer = null; } }
+
+/* ---------- geolocation ---------- */
+let lastFix = null;
+function locate(){
+  if(!navigator.geolocation){ toast("This browser has no GPS support"); return; }
+  $("gpsState").textContent = "acquiring...";
+  navigator.geolocation.getCurrentPosition(onFix, onFixError,
+    {enableHighAccuracy:true, timeout:15000, maximumAge:0});
+}
+function onFix(position){
+  lastFix = position.coords;
+  $("gpsState").textContent = "locked";
+  $("gpsLat").textContent = lastFix.latitude.toFixed(6);
+  $("gpsLon").textContent = lastFix.longitude.toFixed(6);
+  $("gpsAcc").textContent = `${Math.round(lastFix.accuracy)} m`;
+  $("btnRegister").disabled = false;
+}
+function onFixError(error){
+  $("gpsState").textContent = "unavailable";
+  // A laptop indoors, or a page served over plain http, will not give a fix.
+  // Falling back keeps the demo usable instead of dead-ending.
+  lastFix = {latitude: 12.9719, longitude: 77.5937, accuracy: 500};
+  $("gpsLat").textContent = "12.971900 (demo)";
+  $("gpsLon").textContent = "77.593700 (demo)";
+  $("gpsAcc").textContent = "approximate";
+  $("btnRegister").disabled = false;
+  banner("GPS unavailable (" + error.message + "). Using a demo position near the camera.");
+}
+
+function startTracking(){
+  if(!navigator.geolocation || S.watchId !== null) return;
+  S.watchId = navigator.geolocation.watchPosition(async position => {
+    lastFix = position.coords;
+    await pushLocation(position.coords);
+  }, () => {}, {enableHighAccuracy:true, maximumAge:4000, timeout:20000});
+  // Even without a moving GPS, keep the server's view of us fresh.
+  setInterval(() => { if(lastFix) pushLocation(lastFix); }, 12000);
+}
+
+async function pushLocation(coords){
+  if(!S.responder) return;
+  try{
+    const result = await api(`/api/responders/${S.responder.responder_id}/location`, {
+      method:"POST",
+      body: JSON.stringify({
+        latitude: coords.latitude, longitude: coords.longitude,
+        accuracy: coords.accuracy,
+        speed_kmh: coords.speed != null ? coords.speed * 3.6 : null,
+        heading: coords.heading != null ? coords.heading : null
+      })
+    });
+    $("myPos").textContent = `${coords.latitude.toFixed(5)}, ${coords.longitude.toFixed(5)}`;
+    $("myFix").textContent = new Date().toLocaleTimeString();
+    if(result.distance_to_scene_m != null && S.incident && !S.incident.arrived_at){
+      $("jobDist").textContent = (result.distance_to_scene_m / 1000).toFixed(2);
+      $("jobDistLabel").textContent = "km to scene";
+    }
+    moveMe(coords.latitude, coords.longitude);
+    if(result.arrived) onArrived(result.responder);
+  }catch(error){ /* a dropped fix must not break the session */ }
+}
+
+/* ---------- map ---------- */
+function mapReady(){ return typeof L !== "undefined"; }
+function ensureMap(lat, lon){
+  if(!mapReady()){
+    $("mapHint").textContent = "Map tiles need an internet connection. Turn-by-turn directions below still work.";
+    return null;
+  }
+  if(!S.map){
+    $("map").innerHTML = "";
+    S.map = L.map("map", {zoomControl:true, attributionControl:false}).setView([lat, lon], 14);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {maxZoom:19}).addTo(S.map);
+  }
+  return S.map;
+}
+function marker(key, lat, lon, colour, label){
+  if(!S.map) return;
+  if(S.layers[key]) S.map.removeLayer(S.layers[key]);
+  S.layers[key] = L.circleMarker([lat, lon], {
+    radius: 9, color: colour, fillColor: colour, fillOpacity: .85, weight: 2
+  }).addTo(S.map).bindTooltip(label, {permanent:false});
+}
+function moveMe(lat, lon){ marker("me", lat, lon, "#38bdf8", "You"); }
+
+function drawRoute(payload, fromLat, fromLon, toLat, toLon, toLabel){
+  const map = ensureMap(fromLat, fromLon);
+  S.route = payload;
+  const route = payload.route || payload;
+  $("jobEta").textContent = fmt(payload.duration_minutes);
+  $("jobDist").textContent = fmt(payload.distance_km);
+
+  const traffic = route.traffic || {};
+  $("trafficNote").textContent =
+    `${route.source === "osrm" ? "Road route" : "Estimated route"} · traffic ${traffic.level || "unknown"}` +
+    (route.chosen_because ? ` · ${route.chosen_because}` : "") +
+    (traffic.source ? ` · source: ${traffic.source}` : "");
+
+  renderSteps(payload.steps || route.steps || []);
+
+  if(!map) return;
+  marker("scene", toLat, toLon, "#ef4444", toLabel);
+  moveMe(fromLat, fromLon);
+  if(S.layers.line) map.removeLayer(S.layers.line);
+  const coordinates = ((route.geometry || {}).coordinates) || [];
+  if(coordinates.length > 1){
+    const latlngs = coordinates.map(c => [c[1], c[0]]);
+    S.layers.line = L.polyline(latlngs, {color:"#38bdf8", weight:5, opacity:.85}).addTo(map);
+    map.fitBounds(S.layers.line.getBounds(), {padding:[28,28]});
+  } else {
+    map.fitBounds(L.latLngBounds([[fromLat,fromLon],[toLat,toLon]]), {padding:[40,40]});
+  }
+}
+
+const STEP_ICONS = {
+  "turn":"↱","depart":"▲","arrive":"◉","roundabout":"◍","merge":"⤳",
+  "fork":"⑂","end of road":"⇥","continue":"↑","new name":"↑","on ramp":"⤴","off ramp":"⤵"
+};
+function renderSteps(steps){
+  S.lastSteps = steps;
+  const list = $("stepList"); list.innerHTML = "";
+  if(!steps.length){ list.innerHTML = '<li class="muted">No turn-by-turn data available.</li>'; return; }
+  steps.forEach(step => {
+    const li = document.createElement("li");
+    const distance = step.distance_m >= 1000
+      ? (step.distance_m/1000).toFixed(1) + " km" : Math.round(step.distance_m) + " m";
+    li.innerHTML = `<div class="ic">${STEP_ICONS[step.type] || "↑"}</div>
+                    <div class="tx">${step.instruction}</div>
+                    <div class="di">${distance}</div>`;
+    list.appendChild(li);
+  });
+}
+
+/* ---------- websocket ---------- */
+function connectSocket(){
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  const url = `${scheme}://${location.host}/ws?role=responder&responder_id=${S.responder.responder_id}`;
+  const socket = new WebSocket(url);
+  S.socket = socket;
+
+  socket.onopen = () => {
+    $("wsDot").className = "dot on"; $("wsText").textContent = "live";
+    if(S.incident) socket.send(JSON.stringify({action:"follow", incident_id:S.incident.incident_id}));
+  };
+  socket.onclose = () => {
+    $("wsDot").className = "dot off"; $("wsText").textContent = "reconnecting";
+    setTimeout(connectSocket, 2500);
+  };
+  socket.onerror = () => socket.close();
+  socket.onmessage = event => {
+    let message; try{ message = JSON.parse(event.data); } catch(e){ return; }
+    handleEvent(message);
+  };
+}
+
+function handleEvent(message){
+  const data = message.data || {};
+  switch(message.type){
+    case "connected":
+      // Catch up on anything that fired while this phone was offline.
+      refreshAlerts();
+      break;
+    case "incident.alert":
+      showAlert(data.incident, data.assignment);
+      break;
+    case "incident.stand_down":
+      if(S.alert && S.alert.incident_id === message.incident_id){ dismissAlert(); toast("Another unit took that call."); }
+      break;
+    case "incident.accepted":
+      if(data.incident && S.incident && data.incident.incident_id === S.incident.incident_id) S.incident = data.incident;
+      break;
+    case "incident.arrived":
+      if(data.incident && S.incident && data.incident.incident_id === S.incident.incident_id) onArrived();
+      break;
+    case "incident.closed":
+      if(S.incident && data.incident && data.incident.incident_id === S.incident.incident_id) resetToIdle("Case closed.");
+      break;
+  }
+}
+
+async function refreshAlerts(){
+  if(!S.responder) return;
+  try{
+    const alerts = await api(`/api/responders/${S.responder.responder_id}/alerts`);
+    if(!alerts.length) return;
+    const active = alerts.find(a => a.dispatch_status === "ACCEPTED");
+    if(active){ await enterJob(active); return; }
+    const pending = alerts.find(a => a.dispatch_status === "SENT");
+    if(pending && !S.alert) showAlert(pending, {distance_km:pending.distance_km, eta_minutes:pending.eta_minutes});
+  }catch(error){ /* offline */ }
+}
+
+/* ---------- alert takeover ---------- */
+function showAlert(incident, assignment){
+  if(S.incident) return;                    // already on a call
+  S.alert = incident;
+  $("alLabel").textContent = incident.label || "Accident confirmed";
+  $("alLoc").textContent = incident.location_name || `${incident.latitude.toFixed(5)}, ${incident.longitude.toFixed(5)}`;
+  $("alSev").textContent = incident.severity; $("alSev").className = "sev " + incident.severity;
+  $("alId").textContent = incident.incident_id;
+  $("alCam").textContent = incident.camera_id;
+  $("alConf").textContent = Math.round((incident.confidence || 0) * 100) + "%";
+  $("alTime").textContent = new Date(incident.detected_at || incident.created_at).toLocaleTimeString();
+  $("alDist").textContent = fmt(assignment && assignment.distance_km);
+  $("alEta").textContent = fmt(assignment && assignment.eta_minutes);
+  $("alReason").textContent = incident.reason || "";
+  const evidence = $("alEvidence"); evidence.innerHTML = "";
+  (incident.evidence_types || []).forEach(name => {
+    const chip = document.createElement("span"); chip.textContent = name.replace(/_/g," ");
+    evidence.appendChild(chip);
+  });
+  const shot = $("alShot");
+  if(incident.snapshot_path){ shot.src = API + incident.snapshot_path; shot.classList.remove("hidden"); }
+  else shot.classList.add("hidden");
+
+  $("alertScreen").classList.remove("hidden");
+  setStatus("alerted");
+  startSiren();
+}
+function dismissAlert(){
+  stopSiren(); S.alert = null;
+  $("alertScreen").classList.add("hidden");
+  if(!S.incident) setStatus("available");
+}
+
+async function acceptAlert(){
+  const incident = S.alert; if(!incident) return;
+  $("btnAccept").disabled = true;
+  try{
+    const result = await api(`/api/incidents/${incident.incident_id}/accept`, {
+      method:"POST", body: JSON.stringify({responder_id: S.responder.responder_id})
+    });
+    dismissAlert();
+    await enterJob(result.incident, result.route);
+    toast("Call accepted. Navigate to the scene.");
+  }catch(error){
+    toast(error.message); dismissAlert();
+  }finally{ $("btnAccept").disabled = false; }
+}
+
+async function declineAlert(){
+  const incident = S.alert; if(!incident) return;
+  try{
+    await api(`/api/incidents/${incident.incident_id}/decline`, {
+      method:"POST", body: JSON.stringify({responder_id: S.responder.responder_id})
+    });
+  }catch(error){ /* ignore */ }
+  dismissAlert();
+  toast("Declined - the call was passed to another unit.");
+}
+
+/* ---------- active job ---------- */
+async function enterJob(incident, route){
+  S.incident = incident;
+  $("idleCard").classList.add("hidden");
+  $("jobCard").classList.remove("hidden");
+  $("jobId").textContent = incident.incident_id;
+  $("jobLabel").textContent = incident.label;
+  $("jobLoc").textContent = incident.location_name ||
+      `${incident.latitude.toFixed(5)}, ${incident.longitude.toFixed(5)}`;
+  $("jobSeverity").innerHTML = `<span class="sev ${incident.severity}">${incident.severity}</span>`;
+  const shot = $("jobShot");
+  if(incident.snapshot_path){ shot.src = API + incident.snapshot_path; shot.classList.remove("hidden"); }
+  if(S.socket && S.socket.readyState === 1)
+    S.socket.send(JSON.stringify({action:"follow", incident_id: incident.incident_id}));
+
+  setStatus(incident.arrived_at ? "scene" : "enroute");
+  const from = lastFix || {latitude: S.responder.latitude, longitude: S.responder.longitude};
+  if(!route){
+    try{
+      route = await api(`/api/incidents/${incident.incident_id}/route`
+        + `?from_lat=${from.latitude}&from_lon=${from.longitude}`);
+    }catch(error){ toast("Could not build a route: " + error.message); }
+  }
+  if(route) drawRoute(route, from.latitude, from.longitude,
+                      incident.latitude, incident.longitude, "Accident scene");
+  if(incident.arrived_at) onArrived();
+  startTracking();
+}
+
+async function markArrived(){
+  try{
+    const incident = await api(`/api/incidents/${S.incident.incident_id}/arrive`, {
+      method:"POST", body: JSON.stringify({responder_id: S.responder.responder_id})
+    });
+    S.incident = incident; onArrived();
+  }catch(error){ toast(error.message); }
+}
+
+function onArrived(){
+  setStatus("scene");
+  $("btnArrived").classList.add("hidden");
+  $("btnHospitals").classList.remove("hidden");
+  $("btnComplete").classList.remove("hidden");
+  $("jobDistLabel").textContent = "km travelled";
+  toast("On scene. Find a receiving hospital when ready.");
+  loadHospitals(12);
+}
+
+/* ---------- hospitals + transport ---------- */
+async function loadHospitals(radius){
+  $("hospitalCard").classList.remove("hidden");
+  $("hospitalList").innerHTML = '<p class="muted">Searching...</p>';
+  try{
+    const result = await api(`/api/incidents/${S.incident.incident_id}/hospitals?radius_km=${radius}&limit=8`);
+    S.hospitals = result.facilities || [];
+    $("hospitalNote").textContent =
+      `${result.count} found via ${result.source}. Ranked by road travel time from the scene.`;
+    if(result.notes && result.notes.length) banner(result.notes[0]);
+    const list = $("hospitalList"); list.innerHTML = "";
+    if(!S.hospitals.length){ list.innerHTML = '<p class="muted">Nothing found. Try a wider search.</p>'; return; }
+    S.hospitals.forEach((facility, index) => {
+      const row = document.createElement("div");
+      row.className = "facility";
+      row.innerHTML = `<div class="n"><b>${facility.name}${facility.emergency ? '<span class="er">A&amp;E</span>' : ''}</b>
+                         <span>${facility.phone || facility.kind}</span></div>
+                       <div class="m"><b>${fmt(facility.eta_minutes)} min</b>${fmt(facility.distance_km)} km</div>`;
+      row.onclick = () => chooseHospital(index);
+      list.appendChild(row);
+    });
+  }catch(error){
+    $("hospitalList").innerHTML = `<p class="muted">Search failed: ${error.message}</p>`;
+  }
+}
+
+async function chooseHospital(index){
+  const facility = S.hospitals[index]; if(!facility) return;
+  try{
+    const result = await api(`/api/incidents/${S.incident.incident_id}/hospital`, {
+      method:"POST",
+      body: JSON.stringify({
+        responder_id: S.responder.responder_id, name: facility.name,
+        latitude: facility.latitude, longitude: facility.longitude,
+        ref: facility.ref, phone: facility.phone
+      })
+    });
+    S.incident = result.incident;
+    $("hospitalCard").classList.add("hidden");
+    $("jobLabel").textContent = "Transporting to " + facility.name;
+    $("stepsTitle").textContent = "Turn-by-turn to " + facility.name;
+    $("jobDistLabel").textContent = "km to hospital";
+    setStatus("enroute");
+    const from = {latitude: S.incident.latitude, longitude: S.incident.longitude};
+    drawRoute(result.route, from.latitude, from.longitude,
+              facility.latitude, facility.longitude, facility.name);
+    toast("Least-traffic route to " + facility.name);
+  }catch(error){ toast(error.message); }
+}
+
+async function completeCall(){
+  try{
+    await api(`/api/incidents/${S.incident.incident_id}/close`, {
+      method:"POST",
+      body: JSON.stringify({responder_id: S.responder.responder_id, outcome:"RESOLVED",
+                            notes:"Closed by responder"})
+    });
+    resetToIdle("Case closed. You are available again.");
+    loadHistory();
+  }catch(error){ toast(error.message); }
+}
+
+function resetToIdle(message){
+  S.incident = null; S.route = null;
+  $("jobCard").classList.add("hidden");
+  $("hospitalCard").classList.add("hidden");
+  $("idleCard").classList.remove("hidden");
+  $("btnArrived").classList.remove("hidden");
+  $("btnHospitals").classList.add("hidden");
+  $("btnComplete").classList.add("hidden");
+  $("stepsTitle").textContent = "Turn-by-turn";
+  setStatus("available");
+  if(message) toast(message);
+}
+
+/* ---------- status + history ---------- */
+function setStatus(state){
+  const box = $("statusBox");
+  const map = {
+    available:["s-available","AVAILABLE - STANDING BY"],
+    alerted:["s-alerted","EMERGENCY ALERT"],
+    enroute:["s-enroute","EN ROUTE"],
+    scene:["s-scene","ON SCENE"]
+  };
+  const [cls, text] = map[state] || map.available;
+  box.className = "status " + cls; box.textContent = text;
+}
+
+async function loadHistory(){
+  try{
+    const responder = await api(`/api/responders/${S.responder.responder_id}`);
+    const list = $("historyList");
+    const done = (responder.assignments || []).filter(a =>
+      ["CLOSED","CANCELLED","FALSE_ALARM"].includes(a.incident_status));
+    if(!done.length){ list.innerHTML = '<p class="muted">No completed calls yet.</p>'; return; }
+    list.innerHTML = "";
+    done.forEach(item => {
+      const row = document.createElement("div");
+      row.className = "hist";
+      row.innerHTML = `<b>${item.incident_id} · ${item.label}</b>
+        <span>${item.location_name || ""} · ${item.distance_km ?? "?"} km ·
+        ${new Date(item.sent_at).toLocaleString()} · ${item.incident_status}</span>`;
+      list.appendChild(row);
+    });
+  }catch(error){ /* ignore */ }
+}
+
+/* ---------- registration ---------- */
+async function register(){
+  const name = $("rName").value.trim();
+  if(!name){ $("regMsg").textContent = "Enter a crew name."; return; }
+  if(!lastFix){ $("regMsg").textContent = "Get your location first."; return; }
+  $("btnRegister").disabled = true; $("regMsg").textContent = "Registering...";
+  try{
+    S.responder = await api("/api/responders/register", {
+      method:"POST",
+      body: JSON.stringify({
+        name, responder_type: $("rType").value,
+        latitude: lastFix.latitude, longitude: lastFix.longitude,
+        phone: $("rPhone").value.trim() || null,
+        vehicle_number: $("rVehicle").value.trim() || null
+      })
+    });
+    localStorage.setItem("resqtrack_responder", S.responder.responder_id);
+    onSignedOn();
+  }catch(error){
+    $("regMsg").textContent = "Failed: " + error.message;
+    $("btnRegister").disabled = false;
+  }
+}
+
+function onSignedOn(){
+  $("registerCard").classList.add("hidden");
+  $("dutyPanel").classList.remove("hidden");
+  $("myId").textContent = S.responder.responder_id;
+  $("myName").textContent = S.responder.name;
+  $("subtitle").textContent = `${S.responder.responder_type} · ${S.responder.vehicle_number || S.responder.responder_id}`;
+  $("myPos").textContent = `${S.responder.latitude.toFixed(5)}, ${S.responder.longitude.toFixed(5)}`;
+  setStatus("available");
+  connectSocket();
+  startTracking();
+  loadHistory();
+  // Browsers block sound until the user interacts; this primes the context.
+  document.body.addEventListener("click", () => {
+    if(!audioCtx){ try{ audioCtx = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} }
+  }, {once:true});
+}
+
+async function restoreSession(){
+  const saved = localStorage.getItem("resqtrack_responder");
+  if(!saved) return;
+  try{
+    S.responder = await api(`/api/responders/${saved}`);
+    lastFix = {latitude: S.responder.latitude, longitude: S.responder.longitude, accuracy: 50};
+    onSignedOn();
+    locate();
+  }catch(error){ localStorage.removeItem("resqtrack_responder"); }
+}
+
+/* ---------- wiring ---------- */
+$("btnLocate").onclick = locate;
+$("btnRegister").onclick = register;
+$("btnAccept").onclick = acceptAlert;
+$("btnDecline").onclick = declineAlert;
+$("btnArrived").onclick = markArrived;
+$("btnHospitals").onclick = () => loadHospitals(12);
+$("btnRefreshHospitals").onclick = () => loadHospitals(30);
+$("btnComplete").onclick = completeCall;
+$("btnOffDuty").onclick = async () => {
+  try{
+    await api(`/api/responders/${S.responder.responder_id}/status`, {
+      method:"POST", body: JSON.stringify({status:"OFFLINE"})
+    });
+  }catch(e){}
+  localStorage.removeItem("resqtrack_responder");
+  location.reload();
+};
+$("tabNow").onclick = () => {
+  $("tabNow").classList.add("active"); $("tabHistory").classList.remove("active");
+  $("viewNow").classList.remove("hidden"); $("viewHistory").classList.add("hidden");
+};
+$("tabHistory").onclick = () => {
+  $("tabHistory").classList.add("active"); $("tabNow").classList.remove("active");
+  $("viewHistory").classList.remove("hidden"); $("viewNow").classList.add("hidden");
+  loadHistory();
+};
+
+restoreSession();
+</script>
+</body>
+</html>

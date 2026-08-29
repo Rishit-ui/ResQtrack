@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ResQTrack Control Room</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root{
+    --bg:#080b10; --panel:#111823; --panel-2:#18212e; --line:#243040;
+    --text:#e6ecf3; --muted:#7f8ca0; --accent:#38bdf8; --ok:#22c55e;
+    --danger:#ef4444; --warn:#f59e0b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  .top{display:flex;align-items:center;gap:14px;padding:12px 20px;
+       background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:40}
+  .brand{display:flex;align-items:center;gap:11px}
+  .brand .mark{width:36px;height:36px;border-radius:10px;
+       background:linear-gradient(135deg,#ef4444,#f97316);display:grid;place-items:center;font-size:19px}
+  .brand h1{margin:0;font-size:17px;letter-spacing:.3px}
+  .brand p{margin:0;font-size:11px;color:var(--muted)}
+  .metrics{display:flex;gap:20px;margin-left:auto;align-items:center}
+  .metric{text-align:center}
+  .metric b{display:block;font-size:19px;line-height:1.1}
+  .metric span{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.7px}
+  .live{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--muted)}
+  .dot{width:9px;height:9px;border-radius:50%;background:#475569}
+  .dot.on{background:var(--ok);box-shadow:0 0 9px var(--ok)}
+  .dot.off{background:var(--danger)}
+
+  .grid{display:grid;grid-template-columns:370px 1fr 340px;gap:14px;padding:14px;
+        height:calc(100vh - 61px)}
+  @media(max-width:1300px){.grid{grid-template-columns:1fr 1fr;height:auto}}
+  @media(max-width:860px){.grid{grid-template-columns:1fr}}
+  .col{display:flex;flex-direction:column;gap:14px;min-height:0}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+        padding:14px;display:flex;flex-direction:column;min-height:0}
+  .card h2{margin:0 0 11px;font-size:11px;text-transform:uppercase;letter-spacing:1.1px;
+           color:var(--muted);display:flex;align-items:center;gap:8px}
+  .card h2 .count{margin-left:auto;background:var(--panel-2);padding:2px 8px;border-radius:999px;
+                  font-size:11px;color:var(--text)}
+  .scroll{overflow-y:auto;min-height:0;flex:1}
+  .scroll::-webkit-scrollbar{width:7px}
+  .scroll::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
+
+  .inc{border:1px solid var(--line);border-radius:11px;padding:11px;margin-bottom:9px;
+       cursor:pointer;background:var(--panel-2);border-left-width:4px}
+  .inc:hover{border-color:var(--accent)}
+  .inc.sel{border-color:var(--accent);background:#16222f}
+  .inc.CRITICAL{border-left-color:#dc2626}
+  .inc.HIGH{border-left-color:#ea580c}
+  .inc.MODERATE{border-left-color:var(--warn)}
+  .inc.LOW{border-left-color:#475569}
+  .inc .r1{display:flex;align-items:center;gap:8px}
+  .inc .id{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--accent)}
+  .inc .st{margin-left:auto;font-size:10px;padding:2px 7px;border-radius:5px;
+           background:#0f1a26;color:var(--muted);letter-spacing:.5px}
+  .inc .lb{font-weight:600;margin:5px 0 3px;font-size:14px}
+  .inc .mt{font-size:11px;color:var(--muted)}
+  .newflash{animation:flash 1.4s ease-out 3}
+  @keyframes flash{0%,100%{background:var(--panel-2)}50%{background:#3b1418}}
+
+  #map{flex:1;min-height:280px;border-radius:11px;border:1px solid var(--line);background:var(--panel-2)}
+  .feed{position:relative;background:#000;border-radius:11px;overflow:hidden;
+        border:1px solid var(--line);aspect-ratio:16/9}
+  .feed img{width:100%;height:100%;object-fit:contain;display:block}
+  .feed .off{position:absolute;inset:0;display:grid;place-items:center;text-align:center;
+             color:var(--muted);font-size:12px;padding:20px}
+
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th{text-align:left;color:var(--muted);font-weight:500;padding:6px 5px;
+     border-bottom:1px solid var(--line);font-size:10px;text-transform:uppercase;letter-spacing:.6px}
+  td{padding:7px 5px;border-bottom:1px solid #1a2331}
+  .pill{padding:2px 7px;border-radius:999px;font-size:10px;font-weight:600}
+  .pill.AVAILABLE{background:rgba(34,197,94,.16);color:#4ade80}
+  .pill.ALERTED{background:rgba(239,68,68,.18);color:#fca5a5}
+  .pill.EN_ROUTE,.pill.TRANSPORTING{background:rgba(56,189,248,.16);color:#7dd3fc}
+  .pill.ON_SCENE{background:rgba(245,158,11,.16);color:#fbbf24}
+  .pill.OFFLINE{background:#1e293b;color:var(--muted)}
+
+  .sev{display:inline-block;padding:2px 8px;border-radius:999px;font-size:10px;font-weight:700}
+  .sev.CRITICAL{background:#dc2626;color:#fff}
+  .sev.HIGH{background:#ea580c;color:#fff}
+  .sev.MODERATE{background:var(--warn);color:#1e1300}
+  .sev.LOW{background:#475569;color:#e2e8f0}
+
+  .detail dl{display:grid;grid-template-columns:auto 1fr;gap:6px 12px;margin:0 0 12px;font-size:12px}
+  .detail dt{color:var(--muted)}
+  .detail dd{margin:0;text-align:right}
+  .detail img{width:100%;border-radius:10px;border:1px solid var(--line);margin-bottom:11px}
+  .chips{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:11px}
+  .chips span{font-size:10px;padding:2px 8px;border:1px solid var(--line);border-radius:999px;color:var(--muted)}
+  .tl{list-style:none;margin:0;padding:0;font-size:12px}
+  .tl li{padding:7px 0 7px 16px;border-left:2px solid var(--line);position:relative}
+  .tl li::before{content:"";position:absolute;left:-5px;top:12px;width:8px;height:8px;
+                 border-radius:50%;background:var(--accent)}
+  .tl b{display:block;font-size:11px;color:var(--muted);font-weight:500}
+  .empty{color:var(--muted);font-size:12px;text-align:center;padding:26px 10px}
+  .vehrow{display:flex;gap:8px;font-size:11px;padding:5px 0;border-bottom:1px solid #1a2331}
+  .vehrow b{color:var(--accent)}
+  .bar{display:flex;gap:7px;margin-top:10px}
+  button{flex:1;padding:9px;border:0;border-radius:9px;background:var(--panel-2);
+         color:var(--text);border:1px solid var(--line);cursor:pointer;font-size:12px}
+  button:hover{border-color:var(--accent)}
+  button.warn{color:#fca5a5}
+  .tabs{display:flex;gap:5px;margin-bottom:10px}
+  .tabs button{padding:6px;font-size:11px}
+  .tabs button.active{background:var(--accent);color:#04121c;border-color:var(--accent)}
+</style>
+</head>
+<body>
+
+<div class="top">
+  <div class="brand">
+    <div class="mark">🚨</div>
+    <div><h1>ResQTrack Control Room</h1><p>AI accident detection &amp; emergency dispatch · SIH 2026</p></div>
+  </div>
+  <div class="metrics">
+    <div class="metric"><b id="mOpen">0</b><span>Open</span></div>
+    <div class="metric"><b id="mToday">0</b><span>Total</span></div>
+    <div class="metric"><b id="mAvail">0</b><span>Available</span></div>
+    <div class="metric"><b id="mAccept">--</b><span>Avg accept</span></div>
+    <div class="live"><span class="dot" id="wsDot"></span><span id="wsText">connecting</span></div>
+  </div>
+</div>
+
+<div class="grid">
+
+  <!-- LEFT: incident feed -->
+  <div class="col">
+    <div class="card" style="flex:1">
+      <h2>Live incident feed <span class="count" id="incCount">0</span></h2>
+      <div class="tabs">
+        <button id="fAll" class="active">Active</button>
+        <button id="fHist">History</button>
+      </div>
+      <div class="scroll" id="incList"><div class="empty">Waiting for detections…</div></div>
+    </div>
+    <div class="card">
+      <h2>Responders <span class="count" id="respCount">0</span></h2>
+      <div class="scroll" style="max-height:210px">
+        <table><thead><tr><th>Unit</th><th>Type</th><th>Status</th></tr></thead>
+        <tbody id="respBody"></tbody></table>
+      </div>
+    </div>
+  </div>
+
+  <!-- CENTRE: map + camera -->
+  <div class="col">
+    <div class="card" style="flex:1.4">
+      <h2>Operational map</h2>
+      <div id="map"></div>
+    </div>
+    <div class="card">
+      <h2>Camera CAM-001 · live detector view</h2>
+      <div class="feed">
+        <img id="camFeed" alt="detector feed">
+        <div class="off" id="camOff">
+          Detector stream not connected.<br><br>
+          Start it with <code>python main.py</code> — the annotated YOLO11 view
+          is published on port 8001 and appears here automatically.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RIGHT: detail -->
+  <div class="col">
+    <div class="card detail" style="flex:1">
+      <h2>Incident detail</h2>
+      <div class="scroll" id="detail"><div class="empty">Select an incident.</div></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+/* ============================================================
+   ResQTrack control-room dashboard
+   ============================================================ */
+const API = location.origin;
+const STREAM_URL = `http://${location.hostname}:8001/stream`;
+const S = { incidents: [], responders: [], selected: null, map: null,
+            markers: {}, tracks: {}, view: "active" };
+
+const $ = id => document.getElementById(id);
+const fmt = n => (n==null||isNaN(n)) ? "--" : Number(n).toFixed(1);
+const timeOf = t => t ? new Date(t).toLocaleTimeString() : "--";
+
+async function api(path, options){
+  const response = await fetch(API + path, {headers:{"Content-Type":"application/json"}, ...options});
+  if(!response.ok) throw new Error((await response.text()).slice(0,200));
+  return response.json();
+}
+
+/* ---------- map ---------- */
+function initMap(){
+  if(typeof L === "undefined"){
+    $("map").innerHTML = '<div class="empty">Map tiles need an internet connection.</div>';
+    return;
+  }
+  S.map = L.map("map", {zoomControl:true, attributionControl:false}).setView([12.9719,77.5937], 13);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {maxZoom:19}).addTo(S.map);
+}
+
+const SEVERITY_COLOUR = {CRITICAL:"#dc2626", HIGH:"#ea580c", MODERATE:"#f59e0b", LOW:"#64748b"};
+
+function placeIncident(incident){
+  if(!S.map) return;
+  const key = "i:" + incident.incident_id;
+  if(S.markers[key]) S.map.removeLayer(S.markers[key]);
+  const closed = ["CLOSED","CANCELLED","FALSE_ALARM"].includes(incident.status);
+  S.markers[key] = L.circleMarker([incident.latitude, incident.longitude], {
+    radius: closed ? 6 : 11,
+    color: SEVERITY_COLOUR[incident.severity] || "#ef4444",
+    fillColor: SEVERITY_COLOUR[incident.severity] || "#ef4444",
+    fillOpacity: closed ? .3 : .8, weight: 2
+  }).addTo(S.map).bindPopup(
+    `<b>${incident.incident_id}</b><br>${incident.label}<br>${incident.status}`
+  ).on("click", () => selectIncident(incident.incident_id));
+}
+
+function placeResponder(responder){
+  if(!S.map) return;
+  const key = "r:" + responder.responder_id;
+  const colour = responder.status === "AVAILABLE" ? "#22c55e"
+               : responder.status === "OFFLINE" ? "#475569" : "#38bdf8";
+  if(S.markers[key]) S.map.removeLayer(S.markers[key]);
+  S.markers[key] = L.circleMarker([responder.latitude, responder.longitude], {
+    radius: 7, color: colour, fillColor: colour, fillOpacity: .9, weight: 2
+  }).addTo(S.map).bindTooltip(`${responder.name} · ${responder.status}`);
+}
+
+function traceResponder(responderId, lat, lon){
+  if(!S.map) return;
+  const track = S.tracks[responderId] = S.tracks[responderId] || [];
+  track.push([lat, lon]);
+  if(track.length > 400) track.shift();
+  const key = "t:" + responderId;
+  if(S.markers[key]) S.map.removeLayer(S.markers[key]);
+  if(track.length > 1)
+    S.markers[key] = L.polyline(track, {color:"#38bdf8", weight:3, opacity:.55}).addTo(S.map);
+}
+
+/* ---------- rendering ---------- */
+function renderIncidents(){
+  const list = $("incList");
+  const closedStates = ["CLOSED","CANCELLED","FALSE_ALARM"];
+  const items = S.view === "active"
+    ? S.incidents.filter(i => !closedStates.includes(i.status))
+    : S.incidents.filter(i => closedStates.includes(i.status));
+  $("incCount").textContent = items.length;
+  if(!items.length){
+    list.innerHTML = `<div class="empty">${S.view === "active"
+      ? "No open incidents. The system is watching." : "No closed cases yet."}</div>`;
+    return;
+  }
+  list.innerHTML = "";
+  items.forEach(incident => {
+    const card = document.createElement("div");
+    card.className = `inc ${incident.severity}` + (S.selected === incident.incident_id ? " sel" : "");
+    card.innerHTML = `
+      <div class="r1">
+        <span class="id">${incident.incident_id}</span>
+        <span class="sev ${incident.severity}">${incident.severity}</span>
+        <span class="st">${incident.status}</span>
+      </div>
+      <div class="lb">${incident.label}</div>
+      <div class="mt">${incident.location_name || incident.camera_id} ·
+           ${timeOf(incident.created_at)} ·
+           ${Math.round((incident.confidence||0)*100)}% confidence
+           ${incident.assigned_responder ? " · " + incident.assigned_responder : ""}</div>`;
+    card.onclick = () => selectIncident(incident.incident_id);
+    list.appendChild(card);
+  });
+}
+
+function renderResponders(){
+  const body = $("respBody");
+  $("respCount").textContent = S.responders.length;
+  body.innerHTML = "";
+  S.responders.forEach(responder => {
+    const row = document.createElement("tr");
+    row.innerHTML = `<td>${responder.name}<br><span style="color:var(--muted);font-size:10px">
+                       ${responder.responder_id}</span></td>
+                     <td>${responder.responder_type}</td>
+                     <td><span class="pill ${responder.status}">${responder.status}</span></td>`;
+    body.appendChild(row);
+    placeResponder(responder);
+  });
+}
+
+async function selectIncident(incidentId){
+  S.selected = incidentId;
+  renderIncidents();
+  const panel = $("detail");
+  panel.innerHTML = '<div class="empty">Loading…</div>';
+  try{
+    const incident = await api(`/api/incidents/${incidentId}`);
+    panel.innerHTML = detailHtml(incident);
+    $("btnFalse").onclick = () => closeCase(incidentId, "FALSE_ALARM");
+    $("btnClose").onclick = () => closeCase(incidentId, "RESOLVED");
+    if(S.map) S.map.setView([incident.latitude, incident.longitude], 15);
+  }catch(error){
+    panel.innerHTML = `<div class="empty">Could not load: ${error.message}</div>`;
+  }
+}
+
+function detailHtml(incident){
+  const evidence = (incident.evidence_types || [])
+      .map(t => `<span>${t.replace(/_/g," ")}</span>`).join("");
+  const vehicles = (incident.vehicles || []).slice(0,8).map(v =>
+      `<div class="vehrow"><b>${v.type || v.class_name || "?"} #${v.id}</b>
+        <span>${v.colour || ""}</span>
+        <span style="margin-left:auto">${v.speed_kmh ? v.speed_kmh + " km/h" : ""} ${v.state || ""}</span>
+      </div>`).join("") || '<div class="empty">No vehicle detail recorded.</div>';
+  const timeline = (incident.timeline || []).map(event =>
+      `<li><b>${timeOf(event.created_at)} · ${event.event_type}</b>${event.message}</li>`).join("");
+  const dispatches = (incident.dispatches || []).map(d =>
+      `<div class="vehrow"><b>${d.responder_id}</b><span>${d.name}</span>
+        <span style="margin-left:auto">${d.distance_km ?? "?"} km · ${d.status}</span></div>`).join("")
+      || '<div class="empty">No responder alerted.</div>';
+
+  return `
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:9px">
+      <span class="sev ${incident.severity}">${incident.severity}</span>
+      <span class="st" style="font-size:11px;color:var(--muted)">${incident.status}</span>
+      <span style="margin-left:auto;font-family:ui-monospace;font-size:11px;color:var(--accent)">
+        ${incident.incident_id}</span>
+    </div>
+    <div style="font-size:16px;font-weight:600;margin-bottom:8px">${incident.label}</div>
+    ${incident.snapshot_path ? `<img src="${API + incident.snapshot_path}" alt="scene">` : ""}
+    <dl>
+      <dt>Camera</dt><dd>${incident.camera_id}</dd>
+      <dt>Location</dt><dd>${incident.location_name || "—"}</dd>
+      <dt>Coordinates</dt><dd>${incident.latitude.toFixed(5)}, ${incident.longitude.toFixed(5)}</dd>
+      <dt>Confidence</dt><dd>${Math.round((incident.confidence||0)*100)}%</dd>
+      <dt>Model context</dt><dd>${(incident.ml_probability||0).toFixed(3)}</dd>
+      <dt>Detected</dt><dd>${timeOf(incident.detected_at)}</dd>
+      <dt>Accepted</dt><dd>${timeOf(incident.accepted_at)}</dd>
+      <dt>On scene</dt><dd>${timeOf(incident.arrived_at)}</dd>
+      <dt>Hospital</dt><dd>${incident.hospital_name || "—"}</dd>
+      <dt>Closed</dt><dd>${timeOf(incident.closed_at)}</dd>
+    </dl>
+    <h2>Evidence</h2><div class="chips">${evidence || "<span>none</span>"}</div>
+    <p style="font-size:12px;color:var(--muted);margin:0 0 12px">${incident.reason || ""}</p>
+    <h2>Road users involved</h2>${vehicles}
+    <h2 style="margin-top:12px">Dispatch</h2>${dispatches}
+    <h2 style="margin-top:12px">Timeline</h2><ul class="tl">${timeline}</ul>
+    <div class="bar">
+      <button id="btnClose">Close case</button>
+      <button id="btnFalse" class="warn">Mark false alarm</button>
+    </div>`;
+}
+
+async function closeCase(incidentId, outcome){
+  try{
+    await api(`/api/incidents/${incidentId}/close`, {
+      method:"POST", body: JSON.stringify({outcome, notes:"Closed from control room"})
+    });
+    await loadAll();
+    selectIncident(incidentId);
+  }catch(error){ alert(error.message); }
+}
+
+/* ---------- data ---------- */
+async function loadAll(){
+  try{
+    const [incidents, responders, health, stats] = await Promise.all([
+      api("/api/incidents?limit=120"), api("/api/responders"),
+      api("/api/health"), api("/api/stats")
+    ]);
+    S.incidents = incidents; S.responders = responders;
+    $("mOpen").textContent = health.open_incidents;
+    $("mToday").textContent = health.incidents;
+    $("mAvail").textContent = health.available;
+    $("mAccept").textContent = stats.avg_acceptance_seconds
+        ? Math.round(stats.avg_acceptance_seconds) + "s" : "--";
+    renderIncidents(); renderResponders();
+    incidents.forEach(placeIncident);
+  }catch(error){ console.warn("refresh failed", error); }
+}
+
+/* ---------- realtime ---------- */
+function connect(){
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  const socket = new WebSocket(`${scheme}://${location.host}/ws?role=control`);
+  socket.onopen = () => { $("wsDot").className = "dot on"; $("wsText").textContent = "live"; };
+  socket.onclose = () => {
+    $("wsDot").className = "dot off"; $("wsText").textContent = "reconnecting";
+    setTimeout(connect, 2500);
+  };
+  socket.onerror = () => socket.close();
+  socket.onmessage = event => {
+    let message; try{ message = JSON.parse(event.data); }catch(e){ return; }
+    const data = message.data || {};
+    switch(message.type){
+      case "incident.created":
+        if(data.incident){
+          S.incidents.unshift(data.incident);
+          placeIncident(data.incident);
+          renderIncidents();
+          const first = document.querySelector(".inc");
+          if(first) first.classList.add("newflash");
+          notify(data.incident);
+        }
+        loadAll();
+        break;
+      case "incident.accepted":
+      case "incident.arrived":
+      case "incident.transporting":
+      case "incident.closed":
+        loadAll();
+        if(S.selected && message.incident_id === S.selected) selectIncident(S.selected);
+        break;
+      case "responder.location":
+        traceResponder(data.responder_id, data.latitude, data.longitude);
+        loadResponderMarker(data.responder_id, data.latitude, data.longitude);
+        break;
+      case "responder.registered":
+      case "responder.status":
+        loadAll();
+        break;
+    }
+  };
+}
+
+function loadResponderMarker(responderId, lat, lon){
+  const responder = S.responders.find(r => r.responder_id === responderId);
+  if(responder){ responder.latitude = lat; responder.longitude = lon; placeResponder(responder); }
+}
+
+function notify(incident){
+  // A short attention tone; the control room is not always being watched.
+  try{
+    const ctx = new (window.AudioContext||window.webkitAudioContext)();
+    [0, 0.22, 0.44].forEach(offset => {
+      const osc = ctx.createOscillator(), gain = ctx.createGain();
+      osc.frequency.value = 760; osc.type = "square";
+      gain.gain.setValueAtTime(0.0001, ctx.currentTime + offset);
+      gain.gain.exponentialRampToValueAtTime(0.16, ctx.currentTime + offset + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + offset + 0.16);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(ctx.currentTime + offset); osc.stop(ctx.currentTime + offset + 0.18);
+    });
+  }catch(e){}
+  if(window.Notification && Notification.permission === "granted"){
+    new Notification(`${incident.severity}: ${incident.label}`, {
+      body: `${incident.incident_id} at ${incident.location_name || incident.camera_id}`
+    });
+  }
+}
+
+/* ---------- detector stream ---------- */
+function attachStream(){
+  const image = $("camFeed");
+  image.onload = () => $("camOff").style.display = "none";
+  image.onerror = () => {
+    $("camOff").style.display = "grid";
+    setTimeout(() => { image.src = STREAM_URL + "?t=" + Date.now(); }, 5000);
+  };
+  image.src = STREAM_URL;
+}
+
+/* ---------- wiring ---------- */
+$("fAll").onclick = () => {
+  S.view = "active"; $("fAll").classList.add("active"); $("fHist").classList.remove("active");
+  renderIncidents();
+};
+$("fHist").onclick = () => {
+  S.view = "history"; $("fHist").classList.add("active"); $("fAll").classList.remove("active");
+  renderIncidents();
+};
+
+initMap();
+attachStream();
+connect();
+loadAll();
+setInterval(loadAll, 15000);   // safety net if a websocket event is missed
+if(window.Notification && Notification.permission === "default") Notification.requestPermission();
+</script>
+</body>
+</html>

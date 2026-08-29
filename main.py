@@ -1,684 +1,563 @@
-import cv2
+"""ResQTrack live detector - YOLO11 tracking, incident policy and dispatch.
+
+    python main.py                                   # default demo video
+    python main.py --source data/test.mp4 --loop     # any file, replayed
+    python main.py --source 0                        # webcam
+    python main.py --source rtsp://...               # live CCTV feed
+    python main.py --headless                        # server / no display
+    python main.py --sensitivity strict --no-alerts  # tuning runs
+
+While it runs the window shows, for every tracked road user, the YOLO11 class,
+tracker id, detection confidence, estimated speed, heading, colour and motion
+state.  When the incident policy confirms an accident the detector posts it to
+the ResQTrack backend, which pushes it to responders in real time.
+
+Press T at any time to inject a rehearsed test alert - useful on stage when the
+demo video has not reached the crash yet.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
 import time
-import joblib
+from collections import deque
+from datetime import datetime, timezone
+from pathlib import Path
+
+import cv2
 import numpy as np
 import pandas as pd
 
-from collections import deque, defaultdict
-from ultralytics import YOLO
-
-from accident_logic import (
-    update_vehicle,
-    reset_vehicle_history,
-)
-
-from event_engine import (
-    IncidentEvidence,
-    IncidentEventEngine,
-    PERSON,
-    VEHICLE,
-)
-
+from accident_logic import reset_vehicle_history, update_vehicle
 from temporal_features_engine import (
-    extract_frame_features,
-    aggregate_window,
     FEATURES,
-    WINDOW_FRAMES,
     STRIDE_FRAMES,
+    WINDOW_FRAMES,
+    aggregate_window,
+    extract_frame_features,
+)
+from vision.alert_client import AlertClient, AlertPayload
+from vision.incident_engine import CONFIRMED, PERSON, REVIEW, VEHICLE, EnginePolicy, IncidentEngine
+from vision import overlay
+from vision.stream_server import StreamServer
+from vision.vehicle_profile import (
+    PERSON_CLASS,
+    TRACKED_CLASSES,
+    ScaleEstimator,
+    VehicleRegistry,
 )
 
-
-# ============================================================
-# RESQTRACK CONFIGURATION
-# ============================================================
-
-CAMERA_ID = "CAM-001"
-CAMERA_LATITUDE = 12.9720
-CAMERA_LONGITUDE = 77.5949
-
-VIDEO_PATH = "data/accident.mp4"
-YOLO_MODEL = "yolo11n.pt"
-FINAL_MODEL = "resqtrack_final_model.pkl"
-
-# COCO classes used by the current YOLO model:
-# 0 = person, 2 = car, 3 = motorcycle, 5 = bus, 7 = truck
-# People are intentionally included in tracking.  They are kept separate from
-# the legacy vehicle-only ML features and handled by the event policy below.
-PERSON_CLASS = 0
-VEHICLE_CLASSES = [2, 3, 5, 7]
-TRACKED_CLASSES = [PERSON_CLASS, *VEHICLE_CLASSES]
-YOLO_CONFIDENCE = 0.40
-
-# The trained temporal model's probability is context only.  It was trained on
-# traffic windows, not a complete taxonomy of crashes, so it must never be the
-# sole reason an emergency is confirmed.
-ML_THRESHOLD = 0.50
-ALERT_DURATION = 5.0
-
-WINDOW_NAME = "ResQTrack - Accident Detection"
-
-# Vehicle overlay settings. Speed is IMAGE-SPACE until camera
-# calibration is introduced. Do not present it as km/h.
-SHOW_VEHICLE_INFO = True
-SPEED_HISTORY_LENGTH = 5
-STALE_VEHICLE_FRAMES = 60
-
-# Display controls: open full screen by default.  F toggles full screen, I
-# toggles actor labels, and Q/Esc quits.
-START_FULLSCREEN = True
-WINDOWED_SIZE = (1280, 720)
+WINDOW_NAME = "ResQTrack - Live Incident Detection"
+SNAPSHOT_DIR = Path("snapshots")
 
 
 # ============================================================
-# HELPER FUNCTIONS
+# COMMAND LINE
 # ============================================================
 
-def safe_class_name(model, class_id: int) -> str:
-    """Return a readable YOLO class name across Ultralytics versions."""
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="ResQTrack live accident detection and emergency dispatch",
+    )
+    parser.add_argument("--source", default="data/accident.mp4",
+                        help="video file, webcam index or RTSP url")
+    parser.add_argument("--model", default="yolo11n.pt",
+                        help="YOLO11 weights (yolo11n/s/m/l.pt)")
+    parser.add_argument("--temporal-model", default="resqtrack_final_model.pkl",
+                        help="trained temporal context model, or 'none'")
+    parser.add_argument("--conf", type=float, default=0.35, help="YOLO confidence threshold")
+    parser.add_argument("--sensitivity", default="balanced",
+                        choices=("balanced", "high", "strict"),
+                        help="incident policy preset")
+
+    parser.add_argument("--camera-id", default="CAM-001")
+    parser.add_argument("--lat", type=float, default=12.9719, help="camera latitude")
+    parser.add_argument("--lon", type=float, default=77.5937, help="camera longitude")
+    parser.add_argument("--location-name", default="Trinity Junction, MG Road")
+
+    parser.add_argument("--backend", default="http://localhost:8000",
+                        help="ResQTrack backend base url")
+    parser.add_argument("--no-alerts", action="store_true", help="detect but never dispatch")
+    parser.add_argument("--alert-cooldown", type=float, default=25.0,
+                        help="seconds before the same camera may raise another alert")
+
+    parser.add_argument("--stream-port", type=int, default=8001,
+                        help="MJPEG port the dashboard embeds")
+    parser.add_argument("--no-stream", action="store_true")
+    parser.add_argument("--headless", action="store_true", help="no GUI window")
+    parser.add_argument("--loop", action="store_true", help="replay the video forever")
+    parser.add_argument("--record", default="", help="write the annotated view to this mp4")
+    parser.add_argument("--meters-per-pixel", type=float, default=0.0,
+                        help="fixed camera calibration; 0 = estimate from vehicle sizes")
+    parser.add_argument("--max-fps", type=float, default=0.0,
+                        help="throttle processing (0 = source fps for files, free-run for cameras)")
+    return parser.parse_args(argv)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def open_source(source: str) -> tuple[cv2.VideoCapture, float, bool]:
+    """Open a file, a webcam index or a network stream."""
+    is_live = False
+    if source.isdigit():
+        capture = cv2.VideoCapture(int(source))
+        is_live = True
+    else:
+        capture = cv2.VideoCapture(source)
+        is_live = source.startswith(("rtsp://", "http://", "https://", "udp://"))
+    if not capture.isOpened():
+        capture.release()
+        raise SystemExit(f"ResQTrack: could not open video source '{source}'")
+    fps = float(capture.get(cv2.CAP_PROP_FPS))
+    if fps <= 1.0 or fps > 240.0:
+        fps = 25.0
+    return capture, fps, is_live
+
+
+def class_name_for(model, class_id: int) -> str:
     names = getattr(model, "names", {})
-
     if isinstance(names, dict):
         return str(names.get(class_id, class_id))
-
     if isinstance(names, (list, tuple)) and 0 <= class_id < len(names):
         return str(names[class_id])
-
     return str(class_id)
 
 
-def pixel_speed(
-    previous_center: tuple[float, float] | None,
-    current_center: tuple[float, float],
-    fps: float,
-) -> float:
-    """Calculate image-space speed in pixels/second."""
-    if previous_center is None or fps <= 0:
-        return 0.0
+def load_temporal_model(path: str):
+    """The temporal model is optional context; a missing file must not stop us."""
+    if not path or path.lower() == "none":
+        return None
+    try:
+        import joblib
 
-    dx = current_center[0] - previous_center[0]
-    dy = current_center[1] - previous_center[1]
-    distance_pixels = float(np.hypot(dx, dy))
-
-    return distance_pixels * fps
-
-
-def smoothed_speed(history: deque[float]) -> float:
-    """Return a robust recent mean for display."""
-    if not history:
-        return 0.0
-    return float(np.mean(history))
+        package = joblib.load(path)
+        model, features = package["model"], list(package["features"])
+    except Exception as error:  # noqa: BLE001 - any failure degrades to no context
+        print(f"[model] temporal context disabled ({type(error).__name__}: {error})")
+        return None
+    if features != list(FEATURES):
+        print("[model] temporal context disabled: feature order does not match the engine")
+        return None
+    print(f"[model] temporal context loaded ({len(features)} features)")
+    return model
 
 
-def _rectangles_overlap(
-    first: tuple[int, int, int, int],
-    second: tuple[int, int, int, int],
-) -> bool:
-    return not (
-        first[2] <= second[0]
-        or second[2] <= first[0]
-        or first[3] <= second[1]
-        or second[3] <= first[1]
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def build_payload(args, evidence, registry, snapshot: bytes | None) -> AlertPayload:
+    involved_ids = set(evidence.actor_ids)
+    vehicles = [
+        profile.as_dict()
+        for profile in registry.profiles.values()
+        if profile.actor_id in involved_ids or profile.state != "STOPPED"
+    ][:20]
+    return AlertPayload(
+        camera_id=args.camera_id,
+        latitude=args.lat,
+        longitude=args.lon,
+        kind=evidence.kind,
+        label=evidence.label,
+        severity=evidence.severity,
+        confidence=float(evidence.confidence),
+        reason=evidence.reason,
+        frame=evidence.frame,
+        evidence_types=list(evidence.evidence_types),
+        signals=[signal.as_dict() for signal in evidence.signals],
+        involved=[dict(item) for item in evidence.involved],
+        vehicles=vehicles,
+        ml_probability=float(evidence.ml_probability),
+        detected_at=now_iso(),
+        snapshot=snapshot,
     )
 
 
-def draw_actor_information(
-    frame: np.ndarray,
-    actors: dict,
-    speed_histories: dict[int, deque[float]],
-    show_labels: bool,
-) -> None:
-    """Draw compact, non-overlapping labels for tracked road users."""
-    if not show_labels:
-        return
+def rehearsal_evidence(frame_number: int):
+    """A synthetic CONFIRMED verdict for the T key, clearly marked as a drill."""
+    from vision.incident_engine import IncidentEvidence, IncidentSignal
 
-    height, width = frame.shape[:2]
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = max(0.42, min(0.58, min(width, height) / 1450.0))
-    # Keep actor labels out of the incident/status panel in the top left.
-    occupied: list[tuple[int, int, int, int]] = [(0, 0, min(width, 690), 190)]
-
-    # Sorting makes label allocation stable from frame to frame.
-    for actor_id, actor in sorted(
-        actors.items(), key=lambda item: (item[1]["box"][1], item[0])
-    ):
-        x1, y1, x2, y2 = map(int, actor["box"])
-        kind = actor["kind"].upper()
-        speed = smoothed_speed(speed_histories.get(actor_id, deque()))
-        label = f"{kind} #{actor_id}  {speed:.1f}px/s"
-        (text_width, text_height), baseline = cv2.getTextSize(label, font, scale, 1)
-        label_width, label_height = text_width + 10, text_height + baseline + 10
-
-        # Try positions around the box before using the next free row.  This
-        # avoids stacking vehicle details when two boxes are close together.
-        candidates = [
-            (x1, y1 - label_height - 4),
-            (x1, y2 + 4),
-            (x2 + 4, y1),
-            (x1 - label_width - 4, y1),
-        ]
-        position: tuple[int, int] | None = None
-        for raw_x, raw_y in candidates:
-            label_x = max(0, min(raw_x, width - label_width))
-            label_y = max(0, min(raw_y, height - label_height))
-            rectangle = (label_x, label_y, label_x + label_width, label_y + label_height)
-            if not any(_rectangles_overlap(rectangle, item) for item in occupied):
-                position = (label_x, label_y)
-                break
-
-        if position is None:
-            label_x = max(0, min(x1, width - label_width))
-            label_y = 4
-            while any(
-                _rectangles_overlap(
-                    (label_x, label_y, label_x + label_width, label_y + label_height), item
-                )
-                for item in occupied
-            ) and label_y + label_height < height:
-                label_y += label_height + 4
-            position = (label_x, min(label_y, height - label_height))
-
-        label_x, label_y = position
-        rectangle = (label_x, label_y, label_x + label_width, label_y + label_height)
-        occupied.append(rectangle)
-        color = (46, 204, 113) if actor["kind"] == VEHICLE else (255, 191, 0)
-        cv2.rectangle(frame, rectangle[:2], rectangle[2:], (18, 18, 18), -1)
-        cv2.rectangle(frame, rectangle[:2], rectangle[2:], color, 1)
-        cv2.putText(
-            frame, label, (label_x + 5, label_y + text_height + 4), font, scale, color, 1, cv2.LINE_AA
-        )
-
-
-def draw_status_overlay(
-    frame: np.ndarray,
-    latest_probability: float,
-    evidence: IncidentEvidence,
-    accident_active: bool,
-) -> None:
-    """Draw incident policy state without presenting ML context as a verdict."""
-    cv2.putText(
-        frame,
-        f"ML context: {latest_probability:.3f} (not a confirmation trigger)",
-        (25, 35),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        (255, 255, 0),
-        2,
-        cv2.LINE_AA,
+    return IncidentEvidence(
+        status=CONFIRMED,
+        kind="vehicle_vehicle_collision",
+        confidence=0.91,
+        actor_ids=(101, 102),
+        reason="operator-triggered rehearsal alert (not a real detection)",
+        severity="HIGH",
+        signals=(
+            IncidentSignal("approach", 0.9, "rehearsal"),
+            IncidentSignal("contact", 0.9, "rehearsal"),
+            IncidentSignal("disruption", 0.9, "rehearsal"),
+        ),
+        evidence_types=("approach", "contact", "disruption"),
+        frame=frame_number,
     )
 
-    cv2.putText(
-        frame,
-        f"Evidence: {evidence.confidence:.2f}  {evidence.kind.replace('_', ' ') or 'none'}",
-        (25, 65),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        (255, 255, 0),
-        2,
-        cv2.LINE_AA,
-    )
-
-    cv2.putText(
-        frame,
-        "F: full screen   I: labels   Q/Esc: quit",
-        (25, 95),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.60,
-        (255, 255, 0),
-        2,
-        cv2.LINE_AA,
-    )
-
-    if accident_active:
-        status = "!!! ACCIDENT CONFIRMED !!!"
-        origin = (25, 140)
-        scale = 0.85
-        thickness = 3
-        color = (0, 0, 255)
-    elif evidence.status == "REVIEW":
-        status = "REVIEW: DYNAMIC INTERACTION"
-        origin = (25, 140)
-        scale = 0.80
-        thickness = 2
-        color = (0, 165, 255)
-    else:
-        status = "STATUS: NORMAL (PARKED VEHICLES ARE IGNORED)"
-        origin = (25, 140)
-        scale = 0.80
-        thickness = 3
-        color = (0, 255, 0)
-
-    cv2.putText(
-        frame,
-        status,
-        origin,
-        cv2.FONT_HERSHEY_SIMPLEX,
-        scale,
-        color,
-        thickness,
-        cv2.LINE_AA,
-    )
-
-    if evidence.status != "NORMAL":
-        cv2.putText(
-            frame,
-            evidence.reason[:92],
-            (25, 170),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.50,
-            color,
-            1,
-            cv2.LINE_AA,
-        )
-
 
 # ============================================================
-# STARTUP
+# MAIN
 # ============================================================
 
-print()
-print("============================================================")
-print("             RESQTRACK FINAL LIVE SYSTEM")
-print("============================================================")
-print()
-
-print("Camera:", CAMERA_ID)
-print(
-    "Camera location:",
-    f"{CAMERA_LATITUDE:.6f}, {CAMERA_LONGITUDE:.6f}",
-)
-print()
-
-
-# ============================================================
-# LOAD FINAL TEMPORAL MODEL
-# ============================================================
-
-print("Loading final temporal model...")
-
-try:
-    package = joblib.load(FINAL_MODEL)
-except Exception as exc:
-    raise RuntimeError(
-        f"Could not load final model '{FINAL_MODEL}': {exc}"
-    ) from exc
-
-try:
-    final_model = package["model"]
-    model_features = package["features"]
-except (KeyError, TypeError) as exc:
-    raise RuntimeError(
-        "Final model package must contain 'model' and 'features'."
-    ) from exc
-
-if list(model_features) != list(FEATURES):
-    raise ValueError(
-        "Feature-order mismatch between trained model and "
-        "canonical feature engine."
-    )
-
-print("Final model loaded successfully.")
-print("Feature count:", len(FEATURES))
-print()
-
-
-# ============================================================
-# LOAD YOLO
-# ============================================================
-
-print("Loading YOLO...")
-
-try:
-    yolo = YOLO(YOLO_MODEL)
-except Exception as exc:
-    raise RuntimeError(
-        f"Could not load YOLO model '{YOLO_MODEL}': {exc}"
-    ) from exc
-
-print("YOLO loaded successfully.")
-print()
-
-
-# ============================================================
-# OPEN VIDEO
-# ============================================================
-
-print("Opening video:", VIDEO_PATH)
-
-video = cv2.VideoCapture(VIDEO_PATH)
-
-if not video.isOpened():
-    video.release()
-    raise RuntimeError(
-        f"Could not open video: {VIDEO_PATH}"
-    )
-
-fps = float(video.get(cv2.CAP_PROP_FPS))
-if fps <= 0:
-    fps = 30.0
-
-frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-
-print("Video opened successfully.")
-print("FPS:", round(fps, 3))
-print("Frames:", frame_count if frame_count > 0 else "unknown")
-print()
-
-
-def set_fullscreen(enabled: bool) -> None:
-    """Use an explicit resizable window instead of the backend's half-size default."""
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    if enabled:
-        cv2.setWindowProperty(
-            WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN
-        )
-    else:
-        cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(WINDOW_NAME, *WINDOWED_SIZE)
-
-
-set_fullscreen(START_FULLSCREEN)
-
-
-# ============================================================
-# RESET TRACKING / STATE
-# ============================================================
-
-reset_vehicle_history()
-
-previous_vehicles = None
-previous_previous_vehicles = None
-frame_features: list[dict] = []
-frame_number = 0
-
-# Per-actor display state.
-speed_histories: dict[int, deque[float]] = defaultdict(
-    lambda: deque(maxlen=SPEED_HISTORY_LENGTH)
-)
-vehicle_last_seen: dict[int, int] = {}
-previous_actor_centers: dict[int, tuple[float, float]] = {}
-
-# ML context state.
-latest_probability = 0.0
-max_probability = 0.0
-
-# Event policy and alert state.
-incident_engine = IncidentEventEngine()
-latest_evidence = IncidentEvidence()
-accident_active = False
-accident_start_time = 0.0
-confirmation_frame: int | None = None
-show_actor_info = SHOW_VEHICLE_INFO
-display_fullscreen = START_FULLSCREEN
-
-
-# ============================================================
-# MAIN VIDEO LOOP
-# ============================================================
-
-try:
-    while True:
-        success, frame = video.read()
-
-        if not success:
-            print("Video finished.")
-            break
-
-        frame_number += 1
-
-        # ====================================================
-        # YOLO + BYTE TRACK
-        # ====================================================
-
-        results = yolo.track(
-            frame,
-            persist=True,
-            tracker="bytetrack.yaml",
-            conf=YOLO_CONFIDENCE,
-            classes=TRACKED_CLASSES,
-            verbose=False,
-        )
-
-        if not results:
-            continue
-
-        result = results[0]
-
-        # ====================================================
-        # EXTRACT TRACKED VEHICLES
-        # ====================================================
-
-        vehicles: dict[int, dict] = {}
-        actors: dict[int, dict] = {}
-
-        has_boxes = (
-            result.boxes is not None
-            and result.boxes.id is not None
-            and result.boxes.cls is not None
-        )
-
-        if has_boxes:
-            boxes = result.boxes.xyxy.cpu().numpy()
-            ids = (
-                result.boxes.id
-                .cpu()
-                .numpy()
-                .astype(int)
-            )
-            class_ids = (
-                result.boxes.cls
-                .cpu()
-                .numpy()
-                .astype(int)
-            )
-
-            for box, vehicle_id, class_id in zip(
-                boxes,
-                ids,
-                class_ids,
-            ):
-                vehicle_id = int(vehicle_id)
-                class_id = int(class_id)
-
-                x1, y1, x2, y2 = map(float, box)
-                center = (
-                    (x1 + x2) / 2.0,
-                    (y1 + y2) / 2.0,
-                )
-
-                class_name = safe_class_name(yolo, class_id)
-                kind = PERSON if class_id == PERSON_CLASS else VEHICLE
-
-                previous_center = previous_actor_centers.get(vehicle_id)
-
-                speed_px_s = pixel_speed(
-                    previous_center,
-                    center,
-                    fps,
-                )
-
-                speed_histories[vehicle_id].append(speed_px_s)
-                vehicle_last_seen[vehicle_id] = frame_number
-
-                actors[vehicle_id] = {
-                    "center": center,
-                    "box": (x1, y1, x2, y2),
-                    "class_id": class_id,
-                    "class_name": class_name,
-                    "kind": kind,
-                    "speed_pixels_per_second": speed_px_s,
-                }
-
-                # The shipped ML model was trained only on vehicles.  Do not
-                # contaminate its feature vector with people; the event engine
-                # below evaluates vehicle-to-person interactions separately.
-                if kind == VEHICLE:
-                    vehicles[vehicle_id] = actors[vehicle_id]
-                    update_vehicle(vehicle_id, center)
-
-        # Remove stale display state.
-        stale_ids = [
-            vehicle_id
-            for vehicle_id, last_seen in vehicle_last_seen.items()
-            if frame_number - last_seen > STALE_VEHICLE_FRAMES
-        ]
-
-        for vehicle_id in stale_ids:
-            vehicle_last_seen.pop(vehicle_id, None)
-            speed_histories.pop(vehicle_id, None)
-
-        latest_evidence = incident_engine.update(actors)
-
-        # ====================================================
-        # CANONICAL FRAME FEATURES
-        # ====================================================
-
-        current_features = extract_frame_features(
-            vehicles,
-            previous_vehicles,
-            previous_previous_vehicles,
-        )
-
-        frame_features.append(current_features)
-
-        if len(frame_features) > WINDOW_FRAMES:
-            frame_features = frame_features[-WINDOW_FRAMES:]
-
-        # Save previous-frame references after feature extraction.
-        previous_previous_vehicles = previous_vehicles
-        previous_vehicles = vehicles
-        previous_actor_centers = {
-            actor_id: actor["center"] for actor_id, actor in actors.items()
-        }
-
-        # ====================================================
-        # TEMPORAL ML WINDOW
-        # Match training: WINDOW_FRAMES + STRIDE_FRAMES.
-        # ====================================================
-
-        window_ready = len(frame_features) >= WINDOW_FRAMES
-        stride_ready = (
-            frame_number >= WINDOW_FRAMES
-            and (frame_number - WINDOW_FRAMES) % STRIDE_FRAMES == 0
-        )
-
-        if window_ready and stride_ready:
-            aggregated = aggregate_window(frame_features)
-
-            if aggregated is not None:
-                model_input = pd.DataFrame(
-                    [
-                        [aggregated[feature] for feature in FEATURES]
-                    ],
-                    columns=FEATURES,
-                )
-
-                probability = float(
-                    final_model.predict_proba(model_input)[0][1]
-                )
-
-                latest_probability = probability
-                max_probability = max(max_probability, probability)
-
-        # A model probability can support a human review, but it cannot
-        # dispatch an emergency.  Confirmation needs dynamic, time-ordered
-        # evidence from IncidentEventEngine (collision or pedestrian impact).
-        if latest_evidence.confirmed and not accident_active:
-            accident_active = True
-            accident_start_time = time.time()
-            confirmation_frame = frame_number
-
-            print()
-            print("================================================")
-            print("🚨 ACCIDENT CONFIRMED")
-            print("================================================")
-            print("Camera:", CAMERA_ID)
-            print("Frame:", frame_number)
-            print("Event type:", latest_evidence.kind)
-            print("Evidence:", latest_evidence.reason)
-            print("Evidence confidence:", round(latest_evidence.confidence, 3))
-            print("ML context (not trigger):", round(latest_probability, 4))
-            print(
-                "Location:",
-                f"{CAMERA_LATITUDE:.6f}, {CAMERA_LONGITUDE:.6f}",
-            )
-            print("================================================")
-            print()
-
-        # ====================================================
-        # ACCIDENT ALERT TIMER
-        # ====================================================
-
-        if accident_active:
-            elapsed = time.time() - accident_start_time
-
-            if elapsed >= ALERT_DURATION:
-                accident_active = False
-                confirmation_frame = None
-                print("Accident alert cleared.")
-
-        # ====================================================
-        # RENDER FRAME
-        # ====================================================
-
-        # Ultralytics' default labels and our detailed labels used to render
-        # on top of each other.  Keep its boxes, render one managed label per
-        # actor below, and place those labels in free screen space.
-        annotated_frame = result.plot(labels=False, conf=False)
-
-        draw_actor_information(
-            annotated_frame,
-            actors,
-            speed_histories,
-            show_actor_info,
-        )
-
-        draw_status_overlay(
-            annotated_frame,
-            latest_probability,
-            latest_evidence,
-            accident_active,
-        )
-
-        # Show a compact camera identifier.
-        cv2.putText(
-            annotated_frame,
-            f"Camera: {CAMERA_ID}",
-            (25, max(170, annotated_frame.shape[0] - 20)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-
-        cv2.imshow(WINDOW_NAME, annotated_frame)
-
-        # Real-time-ish playback at the source video's FPS.
-        delay = max(1, int(round(1000.0 / fps)))
-        key = cv2.waitKey(delay) & 0xFF
-
-        if key == ord("q") or key == 27:
-            print("Stopped by user.")
-            break
-        if key == ord("f"):
-            display_fullscreen = not display_fullscreen
-            set_fullscreen(display_fullscreen)
-        if key == ord("i"):
-            show_actor_info = not show_actor_info
-
-finally:
-    # ========================================================
-    # CLEANUP
-    # ========================================================
-
-    video.release()
-    cv2.destroyAllWindows()
-    reset_vehicle_history()
-    incident_engine.reset()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
 
     print()
-    print("============================================================")
-    print("ResQTrack stopped.")
-    print("Frames processed:", frame_number)
-    print("Maximum ML probability:", round(max_probability, 4))
-    print("============================================================")
+    print("=" * 66)
+    print("  ResQTrack - AI accident detection and emergency response")
+    print("=" * 66)
+    print(f"  camera     : {args.camera_id} @ {args.lat:.5f}, {args.lon:.5f}")
+    print(f"  location   : {args.location_name}")
+    print(f"  source     : {args.source}")
+    print(f"  policy     : {args.sensitivity}")
+    print("=" * 66)
+    print()
+
+    from ultralytics import YOLO
+
+    yolo = YOLO(args.model)
+    print(f"[yolo] {args.model} ready")
+
+    temporal_model = load_temporal_model(args.temporal_model)
+    capture, fps, is_live = open_source(args.source)
+    total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"[video] {fps:.1f} fps, {total_frames if total_frames > 0 else 'live'} frames")
+
+    policy = EnginePolicy.for_sensitivity(args.sensitivity)
+    frame_size = (
+        int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),
+        int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+    )
+    engine = IncidentEngine(policy=policy, fps=fps, frame_size=frame_size)
+    scale = ScaleEstimator(args.meters_per_pixel or None)
+    registry = VehicleRegistry(scale, fps)
+
+    alerts = AlertClient(args.backend, enabled=not args.no_alerts)
+    alerts.start()
+    if not args.no_alerts:
+        reachable = alerts.check_backend()
+        print(
+            f"[backend] {args.backend} "
+            + ("reachable" if reachable else "NOT reachable - alerts will spool to alerts_offline/")
+        )
+
+    stream: StreamServer | None = None
+    if not args.no_stream:
+        stream = StreamServer(port=args.stream_port)
+        url = stream.start()
+        if url:
+            print(f"[stream] annotated feed at {url}")
+
+    writer: cv2.VideoWriter | None = None
+    display = not args.headless
+    if display:
+        try:
+            cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(WINDOW_NAME, 1360, 766)
+        except cv2.error:
+            print("[display] no GUI available, continuing headless")
+            display = False
+
+    reset_vehicle_history()
+    SNAPSHOT_DIR.mkdir(exist_ok=True)
+
+    frame_number = 0
+    frame_features: list[dict] = []
+    previous_vehicles: dict | None = None
+    previous_previous_vehicles: dict | None = None
+    ml_probability = 0.0
+    peak_ml_probability = 0.0
+
+    alert_active_until = 0.0
+    last_alert_time = -1e9
+    alert_evidence = None
+    confirmed_count = 0
+    fps_samples: deque[float] = deque(maxlen=30)
+    show_cards = True
+    show_roster = True
+    fullscreen = False
+    target_period = 0.0
+    if args.max_fps > 0:
+        target_period = 1.0 / args.max_fps
+    elif not is_live:
+        target_period = 1.0 / fps
+
+    try:
+        while True:
+            loop_start = time.time()
+            ok, frame = capture.read()
+            if not ok:
+                if args.loop and not is_live:
+                    capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    # A replay is a new scene: stale tracks would create ghost events.
+                    engine.reset()
+                    registry.profiles.clear()
+                    frame_features.clear()
+                    previous_vehicles = previous_previous_vehicles = None
+                    continue
+                print("[video] source finished")
+                break
+
+            frame_number += 1
+
+            # ----------------------------------------------------------
+            # YOLO11 detection + ByteTrack identities
+            # ----------------------------------------------------------
+            results = yolo.track(
+                frame,
+                persist=True,
+                tracker="bytetrack.yaml",
+                conf=args.conf,
+                classes=list(TRACKED_CLASSES),
+                verbose=False,
+            )
+            if not results:
+                continue
+            result = results[0]
+
+            detections: list[dict] = []
+            actors: dict[int, dict] = {}
+            vehicles: dict[int, dict] = {}
+
+            boxes = result.boxes
+            if boxes is not None and boxes.id is not None:
+                xyxy = boxes.xyxy.cpu().numpy()
+                ids = boxes.id.cpu().numpy().astype(int)
+                classes = boxes.cls.cpu().numpy().astype(int)
+                confidences = boxes.conf.cpu().numpy()
+
+                for box, actor_id, class_id, confidence in zip(xyxy, ids, classes, confidences):
+                    actor_id = int(actor_id)
+                    class_id = int(class_id)
+                    box = tuple(float(value) for value in box)
+                    kind = PERSON if class_id == PERSON_CLASS else VEHICLE
+                    name = class_name_for(yolo, class_id)
+
+                    record = {
+                        "id": actor_id,
+                        "box": box,
+                        "class_id": class_id,
+                        "class_name": name,
+                        "kind": kind,
+                        "confidence": float(confidence),
+                    }
+                    detections.append(record)
+                    actors[actor_id] = record
+
+                    if kind == VEHICLE:
+                        centre = ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+                        vehicles[actor_id] = {"center": centre, "box": box}
+                        update_vehicle(actor_id, centre)
+
+            # ----------------------------------------------------------
+            # Temporal context model (corroboration only)
+            # ----------------------------------------------------------
+            if temporal_model is not None:
+                frame_features.append(
+                    extract_frame_features(vehicles, previous_vehicles, previous_previous_vehicles)
+                )
+                del frame_features[:-WINDOW_FRAMES]
+                window_ready = len(frame_features) >= WINDOW_FRAMES
+                stride_ready = (
+                    frame_number >= WINDOW_FRAMES
+                    and (frame_number - WINDOW_FRAMES) % STRIDE_FRAMES == 0
+                )
+                if window_ready and stride_ready:
+                    aggregated = aggregate_window(frame_features)
+                    if aggregated is not None:
+                        model_input = pd.DataFrame(
+                            [[aggregated[name] for name in FEATURES]], columns=list(FEATURES)
+                        )
+                        ml_probability = float(temporal_model.predict_proba(model_input)[0][1])
+                        peak_ml_probability = max(peak_ml_probability, ml_probability)
+
+            previous_previous_vehicles = previous_vehicles
+            previous_vehicles = vehicles
+
+            # ----------------------------------------------------------
+            # Incident policy
+            # ----------------------------------------------------------
+            evidence = engine.update(
+                actors,
+                frame_number=frame_number,
+                timestamp=frame_number / fps,
+                ml_probability=ml_probability,
+            )
+
+            profiles = registry.update(
+                frame,
+                detections,
+                frame_number,
+                involved_ids=set(evidence.actor_ids) if evidence.status != "NORMAL" else set(),
+                sample_colour=frame_number % 5 == 1,
+            )
+
+            # ----------------------------------------------------------
+            # Dispatch
+            # ----------------------------------------------------------
+            now = time.time()
+            if evidence.confirmed and (now - last_alert_time) >= args.alert_cooldown:
+                last_alert_time = now
+                alert_active_until = now + 12.0
+                alert_evidence = evidence
+                confirmed_count += 1
+                _log_confirmation(args, evidence, frame_number)
+
+                annotated_for_snapshot = _render(
+                    frame.copy(), profiles, evidence, engine, args, scale,
+                    True, show_cards, show_roster, fps_samples, alerts.state,
+                )
+                ok_encode, encoded = cv2.imencode(".jpg", annotated_for_snapshot)
+                snapshot = encoded.tobytes() if ok_encode else None
+                if snapshot:
+                    path = SNAPSHOT_DIR / f"{args.camera_id}-frame{frame_number}.jpg"
+                    path.write_bytes(snapshot)
+                alerts.send(build_payload(args, evidence, registry, snapshot))
+
+            alert_active = now < alert_active_until
+            if not alert_active:
+                alert_evidence = None
+
+            # ----------------------------------------------------------
+            # Render
+            # ----------------------------------------------------------
+            fps_samples.append(1.0 / max(1e-3, time.time() - loop_start))
+            annotated = _render(
+                frame, profiles, alert_evidence or evidence, engine, args, scale,
+                alert_active, show_cards, show_roster, fps_samples, alerts.state,
+            )
+
+            if stream is not None:
+                stream.publish(annotated)
+            if args.record:
+                if writer is None:
+                    writer = cv2.VideoWriter(
+                        args.record,
+                        cv2.VideoWriter_fourcc(*"mp4v"),
+                        fps,
+                        (annotated.shape[1], annotated.shape[0]),
+                    )
+                writer.write(annotated)
+
+            if display:
+                cv2.imshow(WINDOW_NAME, annotated)
+                wait = max(1, int((target_period - (time.time() - loop_start)) * 1000)) if target_period else 1
+                key = cv2.waitKey(wait) & 0xFF
+                if key in (ord("q"), 27):
+                    print("[input] stopped by operator")
+                    break
+                if key == ord("f"):
+                    fullscreen = not fullscreen
+                    cv2.setWindowProperty(
+                        WINDOW_NAME,
+                        cv2.WND_PROP_FULLSCREEN,
+                        cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL,
+                    )
+                if key == ord("i"):
+                    show_cards = not show_cards
+                if key == ord("r"):
+                    show_roster = not show_roster
+                if key == ord("t"):
+                    drill = rehearsal_evidence(frame_number)
+                    alert_evidence = drill
+                    alert_active_until = time.time() + 12.0
+                    last_alert_time = time.time()
+                    print("[drill] rehearsal alert dispatched")
+                    alerts.send(build_payload(args, drill, registry, None))
+            elif target_period:
+                remaining = target_period - (time.time() - loop_start)
+                if remaining > 0:
+                    time.sleep(remaining)
+
+    except KeyboardInterrupt:
+        print("\n[input] interrupted")
+    finally:
+        capture.release()
+        if writer is not None:
+            writer.release()
+        if display:
+            cv2.destroyAllWindows()
+        if stream is not None:
+            stream.stop()
+        alerts.stop()
+        reset_vehicle_history()
+
+        print()
+        print("=" * 66)
+        print("  ResQTrack detector stopped")
+        print(f"  frames processed      : {frame_number}")
+        print(f"  incidents confirmed   : {confirmed_count}")
+        print(f"  alerts delivered      : {alerts.sent_count}")
+        print(f"  alerts spooled offline: {alerts.failed_count}")
+        print(f"  peak model context    : {peak_ml_probability:.4f}")
+        print("=" * 66)
+    return 0
+
+
+def _render(
+    frame: np.ndarray,
+    profiles,
+    evidence,
+    engine: IncidentEngine,
+    args,
+    scale: ScaleEstimator,
+    alert_active: bool,
+    show_cards: bool,
+    show_roster: bool,
+    fps_samples,
+    dispatch_state: str,
+) -> np.ndarray:
+    values = list(profiles.values()) if isinstance(profiles, dict) else list(profiles)
+    overlay.draw_detection_boxes(frame, values)
+
+    reserved: list[tuple[int, int, int, int]] = []
+    status_rect = overlay.draw_status(
+        frame,
+        evidence,
+        alert_active,
+        engine.scene_summary(),
+        args.camera_id,
+        dispatch_state,
+        sum(fps_samples) / len(fps_samples) if fps_samples else 0.0,
+    )
+    reserved.append(status_rect)
+
+    if show_roster:
+        roster_rect = overlay.draw_roster(
+            frame, values, scale.calibrated, scale.metres_per_pixel, reserved
+        )
+        if roster_rect:
+            reserved.append(roster_rect)
+    if show_cards:
+        overlay.draw_vehicle_cards(frame, values, scale.calibrated, reserved)
+    if alert_active:
+        overlay.draw_alert_border(frame, evidence, abs((time.time() * 2) % 2 - 1))
+    overlay.draw_help(frame)
+    return frame
+
+
+def _log_confirmation(args, evidence, frame_number: int) -> None:
+    print()
+    print("!" * 66)
+    print(f"  ACCIDENT CONFIRMED  -  {evidence.label}  ({evidence.severity})")
+    print("!" * 66)
+    print(f"  camera     : {args.camera_id}  ({args.location_name})")
+    print(f"  location   : {args.lat:.6f}, {args.lon:.6f}")
+    print(f"  frame      : {frame_number}")
+    print(f"  confidence : {evidence.confidence:.2f}")
+    print(f"  evidence   : {', '.join(evidence.evidence_types)}")
+    print(f"  reason     : {evidence.reason}")
+    for item in evidence.involved:
+        print(
+            f"    - {item.get('class_name', '?'):<12} #{item.get('id')}  "
+            f"heading {item.get('heading', '-')}"
+        )
+    print(f"  ML context : {evidence.ml_probability:.3f} (corroboration only)")
+    print("!" * 66)
+    print()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

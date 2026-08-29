@@ -270,57 +270,28 @@ def collision_score(vehicles):
                 box2
             )
 
+            # A close pair is a scene condition, not collision evidence.
+            # This legacy helper now requires the time order expected from a
+            # real impact, so roadside parking cannot create a collision pair.
+            approaching = _pair_is_approaching(id1, id2, d)
+            stop_or_turn = (
+                sudden_stop(id1)
+                or sudden_stop(id2)
+                or sudden_direction_change(id1)
+                or sudden_direction_change(id2)
+            )
+            close = iou > 0.15 or d < 45
             pair_score = 0
 
-            # ------------------------------------------------
-            # PHYSICAL PROXIMITY
-            # ------------------------------------------------
-
-            if iou > 0.15:
-
-                pair_score += 35
-
-            elif d < 45:
-
+            if approaching:
                 pair_score += 20
+            if close and approaching:
+                pair_score += 20
+            if stop_or_turn:
+                pair_score += 30
 
-            # ------------------------------------------------
-            # APPROACHING VEHICLES
-            # ------------------------------------------------
-
-            if _pair_is_approaching(
-                id1,
-                id2,
-                d
-            ):
-
-                pair_score += 10
-
-            # ------------------------------------------------
-            # SUDDEN STOP
-            # ------------------------------------------------
-
-            if sudden_stop(id1):
-                pair_score += 15
-
-            if sudden_stop(id2):
-                pair_score += 15
-
-            # ------------------------------------------------
-            # DIRECTION CHANGE
-            # ------------------------------------------------
-
-            if sudden_direction_change(id1):
-                pair_score += 10
-
-            if sudden_direction_change(id2):
-                pair_score += 10
-
-            # ------------------------------------------------
-            # COLLISION EVIDENCE
-            # ------------------------------------------------
-
-            if pair_score >= 40:
+            # Static proximity deliberately can never enter collision_pairs.
+            if close and approaching and stop_or_turn:
 
                 collision_pairs.append(
                     (id1, id2)

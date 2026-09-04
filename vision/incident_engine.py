@@ -1292,14 +1292,23 @@ class IncidentEngine:
             types = hypothesis.evidence_types
             # Something has to have actually happened ...
             has_impact = (
-                ("contact" in types and "disruption" in types)
-                or "pose_change" in types
-                or ("multi_actor" in types and "contact" in types)
-                # A single-vehicle crash has no second party to touch.  Its
-                # impact evidence is a violent disruption that ends with the
-                # vehicle stopped where it should not be.
-                or ("disruption" in types and "immobility" in types)
-            )
+    ("contact" in types and "disruption" in types)
+    or "pose_change" in types
+    or ("multi_actor" in types and "contact" in types)
+    or ("disruption" in types and "immobility" in types)
+
+    # Vehicle-pedestrian events can be visually difficult for
+    # the tracker to express as a clean disruption. For a
+    # sustained approach + contact event, a strong temporal
+    # anomaly may provide the second corroborating signal.
+    or (
+        hypothesis.kind == "vehicle_pedestrian_collision"
+        and "approach" in types
+        and "contact" in types
+        and "model_context" in types
+        and self.ml_probability >= 0.80
+    )
+)
             # ... and the road has to still be wrong afterwards.  Only a
             # genuinely violent, unambiguous impact skips the aftermath test.
             has_aftermath = bool(types & AFTERMATH_EVIDENCE)

@@ -1,16 +1,22 @@
 """ResQTrack live detector - YOLO11 tracking, incident policy and dispatch.
 
-    python main.py
-    python main.py --source data/test.mp4 --loop
-    python main.py --source 0
-    python main.py --source rtsp://...
-    python main.py --headless
-    python main.py --sensitivity strict --no-alerts
+    python main.py                                   # default demo video
+    python main.py --source data/test.mp4 --loop     # any file, replayed
+    python main.py --source 0                        # webcam
+    python main.py --source rtsp://...               # live CCTV feed
+    python main.py --headless                        # server / no display
+    python main.py --sensitivity strict --no-alerts  # tuning runs
 
-The detector uses YOLO11 + ByteTrack, temporal ML context,
-incident reasoning, emergency dispatch, and SQLite logging.
+While it runs the window shows, for every tracked road user, the YOLO11 class,
+tracker id, detection confidence, estimated speed, heading, colour and motion
+state. When the incident policy confirms an accident the detector posts it to
+the ResQTrack backend, which pushes it to responders in real time.
 
-Press T during the display to inject a rehearsal alert.
+The detector also records model runs, vehicle observations and system events
+in the ResQTrack SQLite database.
+
+Press T at any time to inject a rehearsed test alert - useful on stage when the
+demo video has not reached the crash yet.
 """
 
 from __future__ import annotations
@@ -86,7 +92,7 @@ def parse_args(
         description=(
             "ResQTrack live accident detection "
             "and emergency dispatch"
-        )
+        ),
     )
 
     parser.add_argument(
@@ -98,7 +104,7 @@ def parse_args(
     parser.add_argument(
         "--model",
         default="yolo11n.pt",
-        help="YOLO11 weights",
+        help="YOLO11 weights (yolo11n/s/m/l.pt)",
     )
 
     parser.add_argument(
@@ -117,7 +123,11 @@ def parse_args(
     parser.add_argument(
         "--sensitivity",
         default="balanced",
-        choices=("balanced", "high", "strict"),
+        choices=(
+            "balanced",
+            "high",
+            "strict",
+        ),
         help="incident policy preset",
     )
 
@@ -161,14 +171,14 @@ def parse_args(
         "--alert-cooldown",
         type=float,
         default=25.0,
-        help="seconds before same camera may raise another alert",
+        help="seconds before the same camera may raise another alert",
     )
 
     parser.add_argument(
         "--stream-port",
         type=int,
         default=8001,
-        help="MJPEG stream port",
+        help="MJPEG port the dashboard embeds",
     )
 
     parser.add_argument(
@@ -185,46 +195,55 @@ def parse_args(
     parser.add_argument(
         "--loop",
         action="store_true",
-        help="replay video forever",
+        help="replay the video forever",
     )
 
     parser.add_argument(
         "--record",
         default="",
-        help="write annotated output to this mp4",
+        help="write the annotated view to this mp4",
     )
 
     parser.add_argument(
         "--meters-per-pixel",
         type=float,
         default=0.0,
-        help="fixed camera calibration",
+        help=(
+            "fixed camera calibration; "
+            "0 = estimate from vehicle sizes"
+        ),
     )
 
     parser.add_argument(
         "--max-fps",
         type=float,
         default=0.0,
-        help="processing FPS limit",
+        help=(
+            "throttle processing "
+            "(0 = source fps for files, "
+            "free-run for cameras)"
+        ),
     )
 
     parser.add_argument(
         "--db-sample-every",
         type=int,
         default=1,
-        help="store vehicle observation every N frames",
+        help="store vehicle observations every N frames",
     )
 
     return parser.parse_args(argv)
 
 
 # ============================================================
-# VIDEO
+# VIDEO SOURCE
 # ============================================================
 
 def open_source(
     source: str,
 ) -> tuple[cv2.VideoCapture, float, bool]:
+
+    """Open a file, webcam index or network stream."""
 
     is_live = False
 
@@ -256,7 +275,7 @@ def open_source(
         capture.release()
 
         raise SystemExit(
-            f"ResQTrack: could not open "
+            "ResQTrack: could not open "
             f"video source '{source}'"
         )
 
@@ -273,7 +292,7 @@ def open_source(
 
 
 # ============================================================
-# YOLO CLASS NAME
+# CLASS NAME
 # ============================================================
 
 def class_name_for(
@@ -316,6 +335,7 @@ def class_name_for(
 # ============================================================
 
 def load_temporal_model(path: str):
+    """Load the trained temporal context model."""
 
     if (
         not path
@@ -376,7 +396,7 @@ def now_iso() -> str:
 
 
 # ============================================================
-# IMAGE-SPACE SPEED
+# SPEED
 # ============================================================
 
 def pixel_speed(
@@ -384,6 +404,12 @@ def pixel_speed(
     current_center: tuple[float, float],
     fps: float,
 ) -> float:
+
+    """
+    Image-space speed in pixels/second.
+
+    This is NOT km/h.
+    """
 
     if (
         previous_center is None
@@ -403,11 +429,7 @@ def pixel_speed(
     )
 
     return float(
-        np.hypot(
-            dx,
-            dy,
-        )
-        * fps
+        np.hypot(dx, dy) * fps
     )
 
 
@@ -421,6 +443,7 @@ def heading_label(
 ) -> str:
 
     if previous_center is None:
+
         return "--"
 
     dx = (
@@ -434,6 +457,7 @@ def heading_label(
     )
 
     if np.hypot(dx, dy) < 1.5:
+
         return "still"
 
     angle = (
@@ -517,12 +541,14 @@ def build_payload(
 
         signals=[
             signal.as_dict()
-            for signal in evidence.signals
+            for signal
+            in evidence.signals
         ],
 
         involved=[
             dict(item)
-            for item in evidence.involved
+            for item
+            in evidence.involved
         ],
 
         vehicles=vehicles,
@@ -544,6 +570,12 @@ def build_payload(
 def rehearsal_evidence(
     frame_number: int,
 ):
+
+    """
+    Synthetic CONFIRMED event for T key.
+
+    Clearly marked as rehearsal.
+    """
 
     from vision.incident_engine import (
         IncidentEvidence,
@@ -637,7 +669,7 @@ def main(
     print()
 
     # ========================================================
-    # YOLO
+    # LOAD YOLO
     # ========================================================
 
     from ultralytics import YOLO
@@ -651,23 +683,19 @@ def main(
     )
 
     # ========================================================
-    # TEMPORAL MODEL
+    # LOAD TEMPORAL MODEL
     # ========================================================
 
-    temporal_model = (
-        load_temporal_model(
-            args.temporal_model
-        )
+    temporal_model = load_temporal_model(
+        args.temporal_model
     )
 
     # ========================================================
-    # VIDEO
+    # OPEN VIDEO
     # ========================================================
 
-    capture, fps, is_live = (
-        open_source(
-            args.source
-        )
+    capture, fps, is_live = open_source(
+        args.source
     )
 
     total_frames = int(
@@ -685,10 +713,8 @@ def main(
     # INCIDENT ENGINE
     # ========================================================
 
-    policy = (
-        EnginePolicy.for_sensitivity(
-            args.sensitivity
-        )
+    policy = EnginePolicy.for_sensitivity(
+        args.sensitivity
     )
 
     frame_size = (
@@ -706,9 +732,7 @@ def main(
 
     engine = IncidentEngine(
         policy=policy,
-
         fps=fps,
-
         frame_size=frame_size,
     )
 
@@ -727,7 +751,6 @@ def main(
 
     alerts = AlertClient(
         args.backend,
-
         enabled=not args.no_alerts,
     )
 
@@ -771,10 +794,14 @@ def main(
             )
 
     # ========================================================
-    # DISPLAY
+    # VIDEO RECORDING
     # ========================================================
 
     writer: cv2.VideoWriter | None = None
+
+    # ========================================================
+    # DISPLAY
+    # ========================================================
 
     display = not args.headless
 
@@ -885,9 +912,17 @@ def main(
 
     try:
 
+        # ----------------------------------------------------
+        # INITIALISE DB
+        # ----------------------------------------------------
+
         initialise_database()
 
         db_connection = connect()
+
+        # ----------------------------------------------------
+        # REGISTER CAMERA
+        # ----------------------------------------------------
 
         register_camera(
             db_connection,
@@ -910,6 +945,10 @@ def main(
             status="ONLINE",
         )
 
+        # ----------------------------------------------------
+        # REGISTER MODEL RUN
+        # ----------------------------------------------------
+
         start_model_run(
             db_connection,
 
@@ -927,6 +966,10 @@ def main(
                 f"{Path(args.temporal_model).name}"
             ),
         )
+
+        # ----------------------------------------------------
+        # START LOG
+        # ----------------------------------------------------
 
         log_system(
             db_connection,
@@ -964,7 +1007,7 @@ def main(
         db_connection = None
 
     # ========================================================
-    # PROCESSING LOOP
+    # PROCESSING
     # ========================================================
 
     try:
@@ -973,7 +1016,13 @@ def main(
 
             loop_start = time.time()
 
-            ok, frame = capture.read()
+            # ------------------------------------------------
+            # READ FRAME
+            # ------------------------------------------------
+
+            ok, frame = (
+                capture.read()
+            )
 
             if not ok:
 
@@ -987,6 +1036,7 @@ def main(
                         0,
                     )
 
+                    # New replay scene
                     engine.reset()
 
                     registry.profiles.clear()
@@ -1009,9 +1059,9 @@ def main(
 
             frame_number += 1
 
-            # =================================================
-            # DATABASE PERIODIC UPDATE
-            # =================================================
+            # ------------------------------------------------
+            # PERIODIC MODEL-RUN UPDATE
+            # ------------------------------------------------
 
             if (
                 db_enabled
@@ -1045,7 +1095,7 @@ def main(
                     db_enabled = False
 
             # =================================================
-            # YOLO + BYTETRACK
+            # YOLO11 + BYTETRACK
             # =================================================
 
             results = yolo.track(
@@ -1086,6 +1136,10 @@ def main(
 
             boxes = result.boxes
 
+            # =================================================
+            # PROCESS DETECTIONS
+            # =================================================
+
             if (
                 boxes is not None
                 and boxes.id is not None
@@ -1116,10 +1170,6 @@ def main(
                     .cpu()
                     .numpy()
                 )
-
-                # ---------------------------------------------
-                # PROCESS TRACKS
-                # ---------------------------------------------
 
                 for (
                     box,
@@ -1158,6 +1208,10 @@ def main(
                         class_id,
                     )
 
+                    # -----------------------------------------
+                    # CENTER
+                    # -----------------------------------------
+
                     center = (
                         (
                             box[0]
@@ -1169,6 +1223,10 @@ def main(
                             + box[3]
                         ) / 2.0,
                     )
+
+                    # -----------------------------------------
+                    # MOVEMENT
+                    # -----------------------------------------
 
                     previous_center = (
                         previous_actor_centers.get(
@@ -1188,6 +1246,10 @@ def main(
                         previous_center,
                         center,
                     )
+
+                    # -----------------------------------------
+                    # RECORD
+                    # -----------------------------------------
 
                     record = {
                         "id": actor_id,
@@ -1209,7 +1271,8 @@ def main(
                         "speed_pixels_per_second":
                             speed_pixels_per_second,
 
-                        "heading": heading,
+                        "heading":
+                            heading,
                     }
 
                     detections.append(
@@ -1219,6 +1282,10 @@ def main(
                     actors[
                         actor_id
                     ] = record
+
+                    # -----------------------------------------
+                    # VEHICLE
+                    # -----------------------------------------
 
                     if kind == VEHICLE:
 
@@ -1234,13 +1301,14 @@ def main(
                             center,
                         )
 
-                        # -----------------------------------------
+                        # =====================================
                         # DATABASE VEHICLE OBSERVATION
-                        # -----------------------------------------
+                        # =====================================
 
                         if (
                             db_enabled
-                            and db_connection is not None
+                            and db_connection
+                            is not None
                             and (
                                 frame_number
                                 % max(
@@ -1292,6 +1360,9 @@ def main(
                                     "vehicle observation failed: "
                                     f"{exc}"
                                 )
+
+                                # Database failure must
+                                # never stop AI detection.
 
                                 db_enabled = False
 
@@ -1352,7 +1423,8 @@ def main(
                                         aggregated[
                                             name
                                         ]
-                                        for name in FEATURES
+                                        for name
+                                        in FEATURES
                                     ]
                                 ],
 
@@ -1375,7 +1447,7 @@ def main(
                         )
 
             # =================================================
-            # TRACK HISTORY
+            # PREVIOUS FRAME
             # =================================================
 
             previous_previous_vehicles = (
@@ -1408,27 +1480,10 @@ def main(
                 ml_probability=(
                     ml_probability
                 ),
+
+                fps=fps
+                
             )
-
-            # =================================================
-            # DEBUG
-            # =================================================
-
-            if frame_number % 25 == 0:
-
-                print(
-                    "[debug] "
-                    f"frame={frame_number} "
-                    f"actors={len(actors)} "
-                    f"vehicles={len(vehicles)} "
-                    f"ml={ml_probability:.3f} "
-                    f"status={evidence.status} "
-                    f"kind={evidence.kind or '-'} "
-                    f"score={evidence.confidence:.3f} "
-                    f"hypotheses={len(engine.hypotheses)} "
-                    f"pairs={len(engine.pairs)} "
-                    f"types={list(evidence.evidence_types)}"
-                )
 
             # =================================================
             # VEHICLE REGISTRY
@@ -1454,7 +1509,7 @@ def main(
             )
 
             # =================================================
-            # CONFIRMED INCIDENT
+            # INCIDENT CONFIRMED
             # =================================================
 
             now = time.time()
@@ -1481,14 +1536,12 @@ def main(
                 confirmed_count += 1
 
                 # ---------------------------------------------
-                # CONSOLE LOG
+                # CONSOLE
                 # ---------------------------------------------
 
                 _log_confirmation(
                     args,
-
                     evidence,
-
                     frame_number,
                 )
 
@@ -1557,22 +1610,20 @@ def main(
                 alerts.send(
                     build_payload(
                         args,
-
                         evidence,
-
                         registry,
-
                         snapshot,
                     )
                 )
 
                 # ---------------------------------------------
-                # DATABASE
+                # DATABASE INCIDENT LOG
                 # ---------------------------------------------
 
                 if (
                     db_enabled
-                    and db_connection is not None
+                    and db_connection
+                    is not None
                 ):
 
                     try:
@@ -1618,13 +1669,12 @@ def main(
                     except Exception as exc:
 
                         print(
-                            "[database] "
-                            "incident logging failed: "
+                            "[database] incident logging failed: "
                             f"{exc}"
                         )
 
             # =================================================
-            # ALERT DISPLAY TIMER
+            # ALERT DISPLAY
             # =================================================
 
             alert_active = (
@@ -1751,9 +1801,9 @@ def main(
                     & 0xFF
                 )
 
-                # -------------------------------------------------
+                # ---------------------------------------------
                 # Q / ESC
-                # -------------------------------------------------
+                # ---------------------------------------------
 
                 if key in (
                     ord("q"),
@@ -1767,9 +1817,9 @@ def main(
 
                     break
 
-                # -------------------------------------------------
-                # F
-                # -------------------------------------------------
+                # ---------------------------------------------
+                # F = FULLSCREEN
+                # ---------------------------------------------
 
                 if key == ord("f"):
 
@@ -1789,9 +1839,9 @@ def main(
                         ),
                     )
 
-                # -------------------------------------------------
-                # I
-                # -------------------------------------------------
+                # ---------------------------------------------
+                # I = VEHICLE CARDS
+                # ---------------------------------------------
 
                 if key == ord("i"):
 
@@ -1799,9 +1849,9 @@ def main(
                         not show_cards
                     )
 
-                # -------------------------------------------------
-                # R
-                # -------------------------------------------------
+                # ---------------------------------------------
+                # R = RESPONDER ROSTER
+                # ---------------------------------------------
 
                 if key == ord("r"):
 
@@ -1809,9 +1859,9 @@ def main(
                         not show_roster
                     )
 
-                # -------------------------------------------------
-                # T
-                # -------------------------------------------------
+                # ---------------------------------------------
+                # T = REHEARSAL ALERT
+                # ---------------------------------------------
 
                 if key == ord("t"):
 
@@ -1844,18 +1894,16 @@ def main(
                     alerts.send(
                         build_payload(
                             args,
-
                             drill,
-
                             registry,
-
                             None,
                         )
                     )
 
                     if (
                         db_enabled
-                        and db_connection is not None
+                        and db_connection
+                        is not None
                     ):
 
                         try:
@@ -1865,7 +1913,9 @@ def main(
 
                                 level="INFO",
 
-                                component="detector",
+                                component=(
+                                    "detector"
+                                ),
 
                                 message=(
                                     "Rehearsal alert "
@@ -1903,7 +1953,7 @@ def main(
                             )
 
             # =================================================
-            # FPS THROTTLE
+            # FPS LIMIT
             # =================================================
 
             elif target_period:
@@ -1935,7 +1985,7 @@ def main(
         )
 
     # ========================================================
-    # ERROR
+    # FAILED
     # ========================================================
 
     except Exception as exc:
@@ -1943,8 +1993,8 @@ def main(
         db_status = "FAILED"
 
         if (
-            db_enabled
-            and db_connection is not None
+            db_connection is not None
+            and db_enabled
         ):
 
             try:
@@ -1977,7 +2027,7 @@ def main(
     finally:
 
         # ----------------------------------------------------
-        # DATABASE FINALIZATION
+        # FINISH DATABASE RUN
         # ----------------------------------------------------
 
         if db_connection is not None:
@@ -2026,24 +2076,44 @@ def main(
                 db_connection.close()
 
         # ----------------------------------------------------
-        # VIDEO CLEANUP
+        # RELEASE VIDEO
         # ----------------------------------------------------
 
         capture.release()
+
+        # ----------------------------------------------------
+        # RELEASE WRITER
+        # ----------------------------------------------------
 
         if writer is not None:
 
             writer.release()
 
+        # ----------------------------------------------------
+        # CLOSE WINDOW
+        # ----------------------------------------------------
+
         if display:
 
             cv2.destroyAllWindows()
+
+        # ----------------------------------------------------
+        # STOP STREAM
+        # ----------------------------------------------------
 
         if stream is not None:
 
             stream.stop()
 
+        # ----------------------------------------------------
+        # STOP ALERT CLIENT
+        # ----------------------------------------------------
+
         alerts.stop()
+
+        # ----------------------------------------------------
+        # RESET VEHICLE HISTORY
+        # ----------------------------------------------------
 
         reset_vehicle_history()
 
@@ -2234,7 +2304,7 @@ def _render(
 
 
 # ============================================================
-# CONSOLE INCIDENT LOG
+# CONSOLE CONFIRMATION
 # ============================================================
 
 def _log_confirmation(

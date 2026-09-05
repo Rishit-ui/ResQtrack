@@ -106,11 +106,33 @@
   button:hover{border-color:var(--accent)}
   button.warn{color:#fca5a5}
   .tabs{display:flex;gap:5px;margin-bottom:10px}
+
+  .top-actions{display:flex;gap:7px;align-items:center;margin-left:12px}
+  .top-actions a,.top-actions button{flex:0 0 auto;padding:8px 11px;border-radius:8px;text-decoration:none}
+  .top-actions a{background:var(--panel-2);color:var(--text);border:1px solid var(--line);font-size:11px}
+  .top-actions a:hover{border-color:var(--accent)}
+  .alert-banner{display:none;position:fixed;left:14px;right:14px;top:74px;z-index:100;
+    background:linear-gradient(90deg,#4b1118,#241014);border:1px solid #ef4444;border-radius:12px;
+    padding:12px 15px;box-shadow:0 12px 35px rgba(0,0,0,.45);align-items:center;gap:12px}
+  .alert-banner.show{display:flex;animation:flash 1.2s ease-out 3}
+  .alert-banner .pulse{width:10px;height:10px;border-radius:50%;background:#ef4444;box-shadow:0 0 12px #ef4444;flex:0 0 auto}
+  .alert-banner strong{font-size:13px}.alert-banner span{font-size:11px;color:#fecaca}
+  .alert-banner .dismiss{margin-left:auto;flex:0 0 auto;padding:6px 10px}
+  .healthline{display:flex;gap:6px;align-items:center;font-size:10px;color:var(--muted)}
+  .healthline .ok{color:#4ade80}.healthline .bad{color:#fca5a5}
+  .mini{font-size:10px;color:var(--muted);margin-top:5px}
   .tabs button{padding:6px;font-size:11px}
   .tabs button.active{background:var(--accent);color:#04121c;border-color:var(--accent)}
 </style>
 </head>
 <body>
+
+
+<div class="alert-banner" id="alertBanner">
+  <span class="pulse"></span>
+  <div><strong id="alertTitle">NEW EMERGENCY INCIDENT</strong><br><span id="alertMeta">A confirmed incident requires attention.</span></div>
+  <button class="dismiss" id="dismissAlert">Dismiss</button>
+</div>
 
 <div class="top">
   <div class="brand">
@@ -123,6 +145,11 @@
     <div class="metric"><b id="mAvail">0</b><span>Available</span></div>
     <div class="metric"><b id="mAccept">--</b><span>Avg accept</span></div>
     <div class="live"><span class="dot" id="wsDot"></span><span id="wsText">connecting</span></div>
+    <div class="top-actions">
+      <a href="/dashboard">Control</a>
+      <a href="/responder" target="_blank">Responder</a>
+      <button id="refreshBtn">Refresh</button>
+    </div>
   </div>
 </div>
 
@@ -145,6 +172,14 @@
         <tbody id="respBody"></tbody></table>
       </div>
     </div>
+    <div class="card">
+      <h2>System health</h2>
+      <div class="mini" id="healthText">Checking backend…</div>
+      <div class="bar">
+        <button id="fitMapBtn">Fit active incidents</button>
+        <button id="requestNotifyBtn">Enable notifications</button>
+      </div>
+    </div>
   </div>
 
   <!-- CENTRE: map + camera -->
@@ -154,7 +189,7 @@
       <div id="map"></div>
     </div>
     <div class="card">
-      <h2>Camera CAM-001 · live detector view</h2>
+      <h2>Camera CAM-001 · live detector view <span class="count" id="detectorState">offline</span></h2>
       <div class="feed">
         <img id="camFeed" alt="detector feed">
         <div class="off" id="camOff">
@@ -162,6 +197,7 @@
           Start it with <code>python main.py</code> — the annotated YOLO11 view
           is published on port 8001 and appears here automatically.
         </div>
+        <div class="healthline" id="cameraHealth"><span>●</span> <span>Waiting for detector stream…</span></div>
       </div>
     </div>
   </div>
@@ -372,15 +408,38 @@ async function loadAll(){
       api("/api/incidents?limit=120"), api("/api/responders"),
       api("/api/health"), api("/api/stats")
     ]);
-    S.incidents = incidents; S.responders = responders;
-    $("mOpen").textContent = health.open_incidents;
-    $("mToday").textContent = health.incidents;
-    $("mAvail").textContent = health.available;
+
+    S.incidents = incidents;
+    S.responders = responders;
+    S.lastHealth = health;
+
+    $("mOpen").textContent = health.open_incidents ?? 0;
+    $("mToday").textContent = health.incidents ?? 0;
+    $("mAvail").textContent = health.available ?? 0;
     $("mAccept").textContent = stats.avg_acceptance_seconds
-        ? Math.round(stats.avg_acceptance_seconds) + "s" : "--";
-    renderIncidents(); renderResponders();
+      ? Math.round(stats.avg_acceptance_seconds) + "s"
+      : "--";
+
+    $("healthText").textContent =
+      `Backend: ${health.status || health.service || "ONLINE"} · ` +
+      `${health.responders ?? 0} responders · ` +
+      `${health.open_incidents ?? 0} active incidents`;
+
+    renderIncidents();
+    renderResponders();
     incidents.forEach(placeIncident);
-  }catch(error){ console.warn("refresh failed", error); }
+
+    const open = incidents.filter(i =>
+      !["CLOSED","CANCELLED","FALSE_ALARM"].includes(i.status)
+    );
+
+    if(open.length){
+      open.slice(0,1).forEach(placeIncident);
+    }
+  }catch(error){
+    console.warn("refresh failed", error);
+    $("healthText").textContent = "Backend unavailable: " + error.message;
+  }
 }
 
 /* ---------- realtime ---------- */
@@ -456,13 +515,48 @@ function notify(incident){
 /* ---------- detector stream ---------- */
 function attachStream(){
   const image = $("camFeed");
-  image.onload = () => $("camOff").style.display = "none";
+  image.onload = () => {
+    $("camOff").style.display = "none";
+    $("detectorState").textContent = "LIVE";
+    $("cameraHealth").innerHTML = '<span class="ok">● LIVE</span><span>Annotated detector stream connected.</span>';
+  };
   image.onerror = () => {
     $("camOff").style.display = "grid";
+    $("detectorState").textContent = "OFFLINE";
+    $("cameraHealth").innerHTML = '<span class="bad">● OFFLINE</span><span>Start <code>python main.py</code> to publish the detector feed.</span>';
     setTimeout(() => { image.src = STREAM_URL + "?t=" + Date.now(); }, 5000);
   };
   image.src = STREAM_URL;
 }
+
+
+function showAlertBanner(incident){
+  $("alertTitle").textContent = `${incident.severity || "HIGH"}: ${incident.label || "New incident"}`;
+  $("alertMeta").textContent = `${incident.incident_id || "incident"} · ${incident.location_name || incident.camera_id || "camera"} · ${timeOf(incident.created_at)}`;
+  $("alertBanner").classList.add("show");
+  setTimeout(() => $("alertBanner").classList.remove("show"), 12000);
+}
+
+function fitActiveIncidents(){
+  if(!S.map) return;
+  const pts = S.incidents.filter(i => !["CLOSED","CANCELLED","FALSE_ALARM"].includes(i.status))
+    .map(i => [i.latitude, i.longitude]);
+  if(!pts.length){ S.map.setView([12.9719,77.5937], 13); return; }
+  S.map.fitBounds(pts, {padding:[30,30], maxZoom:15});
+}
+
+$("dismissAlert").onclick = () => $("alertBanner").classList.remove("show");
+$("refreshBtn").onclick = () => loadAll();
+
+// Keep dashboard operational even if the stream is temporarily absent.
+setInterval(() => {
+  const active = S.incidents.filter(i => !["CLOSED","CANCELLED","FALSE_ALARM"].includes(i.status));
+  if(active.length && S.selected === null) selectIncident(active[0].incident_id);
+}, 10000);
+$("fitMapBtn").onclick = () => fitActiveIncidents();
+$("requestNotifyBtn").onclick = async () => {
+  if(window.Notification) await Notification.requestPermission();
+};
 
 /* ---------- wiring ---------- */
 $("fAll").onclick = () => {
@@ -477,7 +571,7 @@ $("fHist").onclick = () => {
 initMap();
 attachStream();
 connect();
-loadAll();
+loadAll().then(() => fitActiveIncidents());
 setInterval(loadAll, 15000);   // safety net if a websocket event is missed
 if(window.Notification && Notification.permission === "default") Notification.requestPermission();
 </script>

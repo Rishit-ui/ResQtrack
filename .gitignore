@@ -19,6 +19,12 @@ detector_evaluation*.csv
 *.pem
 *.key
 
+# Frontend & Cache
+frontend/node_modules/
+frontend/.npm-cache/
+.npm-cache/
+.pytest_cache/
+
 # OS
 .DS_Store
 Thumbs.db

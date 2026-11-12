@@ -1,12 +1,8 @@
 # ResQTrack
 
-**AI accident detection and end-to-end emergency response — SIH 2026**
+**AI accident detection and end-to-end emergency response platform — SIH 2026**
 
-A single traffic camera watches the road. When it sees a crash it does not just
-raise a flag: it confirms the incident from physical evidence, pushes a live
-alert to the nearest ambulance, navigates that crew to the scene, finds the
-right hospital, routes them there through the lightest traffic, and records
-every second of it.
+A traffic surveillance system watches the road. When it sees an incident it confirms the collision through physical evidence and temporal ML, pushes real-time WebSocket alerts to the nearest ambulances, navigates crews directly to the scene, discovers specialized trauma facilities ranked by live traffic, and logs every transition into an immutable audit trail.
 
 ```
  CAMERA ──► YOLO11 + ByteTrack ──► incident engine ──► CONFIRMED
@@ -15,7 +11,7 @@ every second of it.
                                                           │
                          ┌────────────────────────────────┼─────────────────┐
                          ▼                                ▼                 ▼
-                 control room dashboard          responder's phone      SQLite
+                 control room dashboard          responder mobile app      SQLite
                  (live map + camera feed)        (accept / navigate)    (full history)
                                                           │
                                     accept ─► route to scene ─► arrival geofence
@@ -26,28 +22,84 @@ every second of it.
 
 ---
 
+## Three Integrated Role Experiences
+
+ResQTrack provides three unified portals sharing one secure backend, role-based JWT authentication, and database:
+
+1. **Citizen Portal (`/user/dashboard`)**:
+   - Public account registration (`/register`) and login (`/login`).
+   - Incident submission with GPS location acquisition, crash category selection, and photo attachments.
+   - Private report tracking with status badges (`SUBMITTED`, `APPROVED`, `ESCALATED`, `REJECTED`).
+   - Strict data isolation: Citizens can only inspect their own reports.
+   - Profile management and password reset lifecycle (`/forgot-password`, `/reset-password`).
+
+2. **Control Room & Emergency Command Centre (`/admin/dashboard`)**:
+   - Overview KPI telemetry (active incidents, dispatched units, hospital handovers, mean response time).
+   - Live AI Detector stream HUD (port 8001).
+   - Active Incidents command table with snapshot inspection and evidence breakdown.
+   - Full-screen tactical interactive map (Leaflet) with real-time incident markers, responder units, and trauma centers.
+   - Citizen report review queue with 1-click **Escalate & Dispatch** creating linked active incidents.
+   - Fleet dispatch control & manual standing-down actions.
+   - User administration (role status toggling, staff provisioning).
+   - Immutable security and operational audit trail.
+   - Real-time system health diagnostics (`/api/system/health`).
+
+3. **Ambulance & Responder Unit (`/responder`)**:
+   - Mobile-first crew interface with tactile emergency buttons.
+   - Persistent WebSocket alert chimes synthesized via the Web Audio API.
+   - Turn-by-turn routing to accident scene.
+   - Automated 75m geofencing or manual scene arrival verification.
+   - Dynamic trauma facility ranking by real road driving duration (OSRM + live traffic).
+   - One-click navigation and patient hospital handover completion.
+
+---
+
+## Default Seed Credentials
+
+All accounts are pre-seeded in the database for instant evaluation:
+
+| Role | Email | Password | Access Route |
+|---|---|---|---|
+| **Admin** | `admin@resqtrack.gov` | `Admin@ResQTrack2026!` | `/admin/dashboard` |
+| **Responder** | `responder@resqtrack.gov` | `Responder@2026!` | `/responder` |
+| **Citizen** | `citizen@resqtrack.org` | `Citizen@2026!` | `/user/dashboard` |
+
+*Quick-fill demo buttons are provided on the login page for rapid 1-click access.*
+
+---
+
 ## Quick start
 
 ```bash
-pip install -r requirements.txt      # ultralytics, fastapi, opencv, sklearn ...
-python seed_demo.py                  # demo crews + offline hospital data
-python run_resqtrack.py              # backend + detector, one command
+# 1. Install dependencies
+pip install -r requirements.txt
+
+# 2. Build frontend single-page application
+cd frontend && npm install && npm run build && cd ..
+
+# 3. Seed demo units, hospital facilities, and default accounts
+python seed_demo.py
+
+# 4. Start backend server
+python -m uvicorn backend.app:app --host 0.0.0.0 --port 8000
 ```
 
-Then open:
+Then navigate to:
 
 | What | Where |
 |---|---|
-| Control room | <http://localhost:8000/dashboard> |
-| Responder app (open on your phone) | <http://localhost:8000/responder> |
-| Live detector feed | <http://localhost:8001/stream> |
-| API reference | <http://localhost:8000/docs> |
+| Landing Page | <http://localhost:8000/> |
+| Login & Demo Portal | <http://localhost:8000/login> |
+| Citizen Registration | <http://localhost:8000/register> |
+| Control Room Command Centre | <http://localhost:8000/admin/dashboard> |
+| Responder Mobile App | <http://localhost:8000/responder> |
+| Live Vision Detector Feed | <http://localhost:8001/stream> |
+| OpenAPI / Swagger Docs | <http://localhost:8000/docs> |
 
-To run the pieces separately:
+To run the AI computer-vision accident detector:
 
 ```bash
-python -m uvicorn backend.app:app --host 0.0.0.0 --port 8000    # backend only
-python main.py --source data/test.mp4 --loop                    # detector only
+python main.py --source data/test.mp4 --loop                    # video file
 python main.py --source 0                                       # webcam
 python main.py --source rtsp://user:pass@camera/stream          # live CCTV
 ```

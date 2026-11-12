@@ -63,11 +63,13 @@ def _overpass_query(latitude: float, longitude: float, radius_m: int, kinds: lis
 async def _from_overpass(
     latitude: float, longitude: float, radius_km: float, kinds: list[str]
 ) -> list[dict[str, Any]]:
+    import os
+    http_timeout = float(os.environ.get("RESQTRACK_HTTP_TIMEOUT", "3.0"))
     query = _overpass_query(latitude, longitude, int(radius_km * 1000), kinds)
     last_error: Exception | None = None
     for url in OVERPASS_URLS:
         try:
-            async with httpx.AsyncClient(timeout=25.0, headers={"User-Agent": USER_AGENT}) as client:
+            async with httpx.AsyncClient(timeout=http_timeout, headers={"User-Agent": USER_AGENT}) as client:
                 response = await client.post(url, data={"data": query})
             if response.status_code != 200:
                 last_error = HospitalSearchError(f"Overpass HTTP {response.status_code}")
@@ -122,6 +124,8 @@ def _address_from_tags(tags: dict[str, Any]) -> str:
 # ============================================================
 
 async def _from_nominatim(latitude: float, longitude: float, radius_km: float) -> list[dict[str, Any]]:
+    import os
+    http_timeout = float(os.environ.get("RESQTRACK_HTTP_TIMEOUT", "3.0"))
     south, west, north, east = bounding_box(latitude, longitude, radius_km)
     params = {
         "q": "hospital",
@@ -133,7 +137,7 @@ async def _from_nominatim(latitude: float, longitude: float, radius_km: float) -
         "bounded": 1,
     }
     try:
-        async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": USER_AGENT}) as client:
+        async with httpx.AsyncClient(timeout=http_timeout, headers={"User-Agent": USER_AGENT}) as client:
             response = await client.get(NOMINATIM_URL, params=params)
         if response.status_code != 200:
             raise HospitalSearchError(f"Nominatim HTTP {response.status_code}")

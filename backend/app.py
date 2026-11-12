@@ -22,24 +22,57 @@ import json
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 
+from backend.auth import (
+    ForgotPasswordRequest,
+    PasswordChange,
+    ResetPasswordRequest,
+    TokenResponse,
+    UserLogin,
+    UserProfileUpdate,
+    UserProvisionRequest,
+    UserRegister,
+    check_rate_limit,
+    create_access_token,
+    decode_access_token,
+    get_current_user,
+    get_optional_user,
+    require_admin,
+    require_citizen,
+    require_responder,
+)
 from backend.database import (
     RESPONDER_STATES,
     SNAPSHOT_DIR,
     add_notification,
     can_transition,
     connect,
+    create_manual_report,
+    create_user,
+    get_manual_report,
+    get_user_by_email,
+    get_user_by_id,
+    hash_password,
     initialise,
+    list_audit_logs,
+    list_manual_reports,
+    list_users,
+    log_audit,
     log_event,
     next_id,
     now_utc,
+    review_manual_report,
     row_to_dict,
     rows_to_list,
+    update_user_password,
+    update_user_profile,
+    update_user_status,
+    verify_password,
 )
 from backend.realtime import hub
 from backend.services.dispatch import rank_responders, selection_size
@@ -49,6 +82,7 @@ from backend.services.routing_service import RoutingError, get_route
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
+FRONTEND_DIST = BASE_DIR.parent / "frontend" / "dist"
 
 # A responder within this distance of the scene is treated as having arrived.
 ARRIVAL_RADIUS_METRES = 75.0
@@ -72,6 +106,8 @@ STATIC_DIR.mkdir(exist_ok=True)
 SNAPSHOT_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/snapshots", StaticFiles(directory=SNAPSHOT_DIR), name="snapshots")
+if (FRONTEND_DIST / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
 
 
 # ============================================================
@@ -137,6 +173,25 @@ class CloseIncident(BaseModel):
     notes: str | None = None
 
 
+class ManualReportCreate(BaseModel):
+    category: str = "COLLISION"
+    description: str
+    location_name: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    contact_phone: Optional[str] = None
+
+
+class ManualReportReview(BaseModel):
+    status: str  # "APPROVED", "REJECTED", "ESCALATED"
+    admin_notes: Optional[str] = None
+    severity: Optional[str] = "HIGH"
+
+
+class UserStatusUpdate(BaseModel):
+    status: str  # "ACTIVE", "SUSPENDED"
+
+
 # ============================================================
 # HELPERS
 # ============================================================
@@ -170,22 +225,35 @@ def set_incident_status(connection, incident_id: str, current: str, target: str)
 
 
 # ============================================================
-# SYSTEM
+# SYSTEM AND FRONTEND ROUTES
 # ============================================================
 
+def _serve_spa_or_static(fallback_file: str) -> FileResponse:
+    index_html = FRONTEND_DIST / "index.html"
+    if index_html.exists():
+        return FileResponse(index_html)
+    return FileResponse(STATIC_DIR / fallback_file)
+
+
 @app.get("/")
-def index() -> RedirectResponse:
-    return RedirectResponse("/dashboard")
+def index() -> FileResponse:
+    return _serve_spa_or_static("dashboard.html")
 
 
+@app.get("/login")
+@app.get("/register")
+@app.get("/forgot-password")
+@app.get("/reset-password")
+@app.get("/user/dashboard")
+@app.get("/admin/dashboard")
 @app.get("/dashboard")
-def dashboard_page() -> FileResponse:
-    return FileResponse(STATIC_DIR / "dashboard.html")
+def ui_pages() -> FileResponse:
+    return _serve_spa_or_static("dashboard.html")
 
 
 @app.get("/responder")
 def responder_page() -> FileResponse:
-    return FileResponse(STATIC_DIR / "responder.html")
+    return _serve_spa_or_static("responder.html")
 
 
 @app.get("/api/health")
@@ -258,6 +326,586 @@ def statistics() -> dict[str, Any]:
         "avg_acceptance_seconds": round(response or 0.0, 1),
         "avg_travel_seconds": round(on_scene or 0.0, 1),
     }
+
+
+@app.get("/api/system/health")
+def system_health() -> dict[str, Any]:
+    connection = connect()
+    try:
+        tables = [
+            "incidents", "responders", "dispatches", "incident_events",
+            "facilities", "notifications", "users", "manual_reports", "audit_logs"
+        ]
+        counts = {}
+        for t in tables:
+            try:
+                counts[t] = connection.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
+            except Exception:
+                counts[t] = 0
+        db_size_bytes = 0
+        try:
+            from backend.database import DB_FILE
+            if DB_FILE.exists():
+                db_size_bytes = DB_FILE.stat().st_size
+        except Exception:
+            pass
+    finally:
+        connection.close()
+
+    return {
+        "status": "HEALTHY",
+        "service": "ResQTrack Emergency Engine",
+        "version": app.version,
+        "database": {
+            "engine": "SQLite WAL",
+            "size_bytes": db_size_bytes,
+            "tables": counts,
+        },
+        "realtime": {
+            "live_websocket_connections": hub.connections,
+            "cached_events": len(hub.history),
+        },
+        "server_time": now_utc(),
+    }
+
+
+# ============================================================
+# AUTHENTICATION AND USERS
+# ============================================================
+
+@app.post("/api/auth/register", response_model=TokenResponse)
+def register(data: UserRegister, request: Request) -> dict[str, Any]:
+    client_ip = request.client.host if request.client else "unknown"
+    check_rate_limit(f"register:{client_ip}", max_requests=20, window_seconds=60)
+    connection = connect()
+    try:
+        try:
+            user = create_user(
+                connection,
+                email=data.email,
+                password=data.password,
+                full_name=data.full_name,
+                role="CITIZEN",
+                phone=data.phone,
+            )
+            log_audit(
+                connection,
+                user_id=user["user_id"],
+                action="user_register",
+                target_type="user",
+                target_id=user["user_id"],
+                ip_address=client_ip,
+            )
+            connection.commit()
+        except ValueError as err:
+            raise HTTPException(400, str(err)) from err
+    finally:
+        connection.close()
+
+    token = create_access_token({
+        "sub": user["user_id"],
+        "email": user["email"],
+        "role": user["role"],
+        "name": user["full_name"],
+    })
+    return {"access_token": token, "token_type": "bearer", "user": user}
+
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+def login(data: UserLogin, request: Request) -> dict[str, Any]:
+    client_ip = request.client.host if request.client else "unknown"
+    check_rate_limit(f"login:{client_ip}", max_requests=30, window_seconds=60)
+    connection = connect()
+    try:
+        user = get_user_by_email(connection, data.email)
+        if not user or not verify_password(data.password, user.get("password_hash", "")):
+            raise HTTPException(401, "Invalid email or password")
+        if user.get("status") != "ACTIVE":
+            raise HTTPException(403, "Account is suspended. Please contact dispatch administrator.")
+
+        log_audit(
+            connection,
+            user_id=user["user_id"],
+            action="user_login",
+            target_type="user",
+            target_id=user["user_id"],
+            ip_address=client_ip,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    token_payload = {
+        "sub": user["user_id"],
+        "email": user["email"],
+        "role": user["role"],
+        "name": user["full_name"],
+    }
+    if user.get("responder_id"):
+        token_payload["responder_id"] = user["responder_id"]
+
+    token = create_access_token(token_payload)
+    user.pop("password_hash", None)
+    return {"access_token": token, "token_type": "bearer", "user": user}
+
+
+@app.get("/api/auth/me")
+def get_me(current_user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
+    return current_user
+
+
+@app.post("/api/auth/logout")
+def logout() -> dict[str, str]:
+    return {"message": "Logged out successfully"}
+
+
+@app.put("/api/auth/profile")
+def update_profile(
+    data: UserProfileUpdate,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    connection = connect()
+    try:
+        user = update_user_profile(
+            connection,
+            current_user["user_id"],
+            full_name=data.full_name,
+            phone=data.phone,
+        )
+        log_audit(
+            connection,
+            user_id=current_user["user_id"],
+            action="profile_update",
+            target_type="user",
+            target_id=current_user["user_id"],
+        )
+        connection.commit()
+        user.pop("password_hash", None)
+        return user
+    finally:
+        connection.close()
+
+
+@app.post("/api/auth/change-password")
+def change_password(
+    data: PasswordChange,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, str]:
+    connection = connect()
+    try:
+        raw_user = connection.execute(
+            "SELECT password_hash FROM users WHERE user_id = ?",
+            (current_user["user_id"],),
+        ).fetchone()
+        if not raw_user or not verify_password(data.current_password, raw_user["password_hash"]):
+            raise HTTPException(400, "Current password does not match")
+        update_user_password(connection, current_user["user_id"], data.new_password)
+        log_audit(
+            connection,
+            user_id=current_user["user_id"],
+            action="password_change",
+            target_type="user",
+            target_id=current_user["user_id"],
+        )
+        connection.commit()
+        return {"message": "Password changed successfully"}
+    finally:
+        connection.close()
+
+
+@app.post("/api/auth/forgot-password")
+def forgot_password(data: ForgotPasswordRequest, request: Request) -> dict[str, Any]:
+    client_ip = request.client.host if request.client else "unknown"
+    check_rate_limit(f"forgot:{client_ip}", max_requests=10, window_seconds=60)
+    connection = connect()
+    try:
+        user = get_user_by_email(connection, data.email)
+        token = "RESET-" + next_id(connection, "users", "user_id", "T-", 8)
+        now = now_utc()
+        if user:
+            connection.execute(
+                """
+                INSERT INTO password_resets (reset_token, user_id, expires_at, used, created_at)
+                VALUES (?, ?, datetime('now', '+1 hour'), 0, ?)
+                """,
+                (token, user["user_id"], now),
+            )
+            log_audit(
+                connection,
+                user_id=user["user_id"],
+                action="forgot_password_request",
+                target_type="user",
+                target_id=user["user_id"],
+                ip_address=client_ip,
+            )
+            connection.commit()
+        return {
+            "message": "Password reset instructions recorded.",
+            "reset_token": token,
+        }
+    finally:
+        connection.close()
+
+
+@app.post("/api/auth/reset-password")
+def reset_password(data: ResetPasswordRequest, request: Request) -> dict[str, str]:
+    client_ip = request.client.host if request.client else "unknown"
+    check_rate_limit(f"reset:{client_ip}", max_requests=10, window_seconds=60)
+    connection = connect()
+    try:
+        row = connection.execute(
+            """
+            SELECT * FROM password_resets
+            WHERE reset_token = ? AND used = 0 AND expires_at > datetime('now')
+            """,
+            (data.token,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(400, "Invalid or expired password reset token")
+        user_id = row["user_id"]
+        update_user_password(connection, user_id, data.new_password)
+        connection.execute(
+            "UPDATE password_resets SET used = 1 WHERE reset_token = ?", (data.token,)
+        )
+        log_audit(
+            connection,
+            user_id=user_id,
+            action="password_reset_completed",
+            target_type="user",
+            target_id=user_id,
+            ip_address=client_ip,
+        )
+        connection.commit()
+        return {"message": "Password has been reset successfully"}
+    finally:
+        connection.close()
+
+
+# ============================================================
+# ADMIN USER MANAGEMENT
+# ============================================================
+
+@app.get("/api/admin/users")
+def admin_list_users(
+    role: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    admin_user: dict[str, Any] = Depends(require_admin),
+) -> list[dict[str, Any]]:
+    connection = connect()
+    try:
+        return list_users(connection, role=role, status=status, limit=limit)
+    finally:
+        connection.close()
+
+
+@app.post("/api/admin/users")
+def admin_provision_user(
+    data: UserProvisionRequest,
+    admin_user: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    connection = connect()
+    try:
+        try:
+            user = create_user(
+                connection,
+                email=data.email,
+                password=data.password,
+                full_name=data.full_name,
+                role=data.role,
+                phone=data.phone,
+                responder_id=data.responder_id,
+            )
+            log_audit(
+                connection,
+                user_id=admin_user["user_id"],
+                action="admin_provision_user",
+                target_type="user",
+                target_id=user["user_id"],
+                details={"role": data.role, "responder_id": data.responder_id},
+            )
+            connection.commit()
+            user.pop("password_hash", None)
+            return user
+        except ValueError as err:
+            raise HTTPException(400, str(err)) from err
+    finally:
+        connection.close()
+
+
+@app.patch("/api/admin/users/{user_id}/status")
+def admin_update_user_status(
+    user_id: str,
+    data: UserStatusUpdate,
+    admin_user: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    connection = connect()
+    try:
+        user = get_user_by_id(connection, user_id)
+        if not user:
+            raise HTTPException(404, f"User {user_id} not found")
+        updated = update_user_status(connection, user_id, data.status)
+        log_audit(
+            connection,
+            user_id=admin_user["user_id"],
+            action="admin_update_user_status",
+            target_type="user",
+            target_id=user_id,
+            details={"status": data.status},
+        )
+        connection.commit()
+        updated.pop("password_hash", None)
+        return updated
+    finally:
+        connection.close()
+
+
+@app.get("/api/admin/audit-logs")
+def admin_audit_logs(
+    limit: int = Query(100, ge=1, le=500),
+    action: str | None = None,
+    user_id: str | None = None,
+    admin_user: dict[str, Any] = Depends(require_admin),
+) -> list[dict[str, Any]]:
+    connection = connect()
+    try:
+        return list_audit_logs(connection, limit=limit, action=action, user_id=user_id)
+    finally:
+        connection.close()
+
+
+# ============================================================
+# CITIZEN MANUAL REPORTS
+# ============================================================
+
+@app.post("/api/reports")
+async def submit_manual_report(
+    data: ManualReportCreate,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    connection = connect()
+    try:
+        report = create_manual_report(
+            connection,
+            user_id=current_user["user_id"],
+            category=data.category,
+            description=data.description,
+            location_name=data.location_name,
+            latitude=data.latitude,
+            longitude=data.longitude,
+            contact_phone=data.contact_phone or current_user.get("phone"),
+        )
+        log_audit(
+            connection,
+            user_id=current_user["user_id"],
+            action="report_submitted",
+            target_type="manual_report",
+            target_id=report["report_id"],
+            details={"category": data.category, "location": data.location_name},
+        )
+        add_notification(
+            connection,
+            "control",
+            "New Citizen Incident Report",
+            f"Report {report['report_id']} ({data.category}) submitted by {current_user['full_name']}",
+            report["report_id"],
+            "warning",
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    await hub.broadcast(
+        "report.created",
+        {"report": report},
+        roles={"control"},
+    )
+    return report
+
+
+@app.post("/api/reports/{report_id}/image")
+async def upload_report_image(
+    report_id: str,
+    file: UploadFile = File(...),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    connection = connect()
+    try:
+        report = get_manual_report(connection, report_id)
+        if not report:
+            raise HTTPException(404, f"Report {report_id} not found")
+        if current_user.get("role") != "ADMIN" and report["user_id"] != current_user["user_id"]:
+            raise HTTPException(403, "You do not have permission to modify this report")
+
+        path = SNAPSHOT_DIR / f"{report_id}.jpg"
+        path.write_bytes(await file.read())
+        relative = f"/snapshots/{path.name}"
+        connection.execute(
+            "UPDATE manual_reports SET image_path = ?, updated_at = ? WHERE report_id = ?",
+            (relative, now_utc(), report_id),
+        )
+        connection.commit()
+        report = get_manual_report(connection, report_id)
+    finally:
+        connection.close()
+
+    await hub.broadcast(
+        "report.updated",
+        {"report": report},
+        roles={"control"},
+    )
+    return {"report_id": report_id, "image_path": relative}
+
+
+@app.get("/api/reports/my")
+def get_my_reports(
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    connection = connect()
+    try:
+        return list_manual_reports(connection, user_id=current_user["user_id"])
+    finally:
+        connection.close()
+
+
+@app.get("/api/reports/{report_id}")
+def get_report(
+    report_id: str,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    connection = connect()
+    try:
+        report = get_manual_report(connection, report_id)
+        if not report:
+            raise HTTPException(404, f"Report {report_id} not found")
+        if current_user.get("role") != "ADMIN" and report["user_id"] != current_user["user_id"]:
+            raise HTTPException(403, "You do not have permission to view this report")
+        return report
+    finally:
+        connection.close()
+
+
+@app.get("/api/admin/reports")
+def admin_list_reports(
+    status: str | None = None,
+    limit: int = 100,
+    admin_user: dict[str, Any] = Depends(require_admin),
+) -> list[dict[str, Any]]:
+    connection = connect()
+    try:
+        return list_manual_reports(connection, status=status, limit=limit)
+    finally:
+        connection.close()
+
+
+@app.post("/api/admin/reports/{report_id}/review")
+async def admin_review_report(
+    report_id: str,
+    review: ManualReportReview,
+    admin_user: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    status_target = review.status.upper()
+    if status_target not in ("APPROVED", "REJECTED", "ESCALATED"):
+        raise HTTPException(400, "Review status must be APPROVED, REJECTED, or ESCALATED")
+
+    connection = connect()
+    incident: dict[str, Any] | None = None
+    selected_responders: list[dict[str, Any]] = []
+    try:
+        report = get_manual_report(connection, report_id)
+        if not report:
+            raise HTTPException(404, f"Report {report_id} not found")
+
+        linked_incident_id = report.get("linked_incident_id")
+        if status_target == "ESCALATED" and not linked_incident_id:
+            incident_id = next_id(connection, "incidents", "incident_id", "RQ-", 5)
+            created_at = now_utc()
+            lat = report["latitude"] if report.get("latitude") is not None else 12.9716
+            lon = report["longitude"] if report.get("longitude") is not None else 77.5946
+            sev = (review.severity or "HIGH").upper()
+            connection.execute(
+                """
+                INSERT INTO incidents (
+                    incident_id, status, kind, label, severity, confidence, reason,
+                    evidence_types, camera_id, location_name, latitude, longitude,
+                    snapshot_path, detected_at, created_at
+                ) VALUES (?, 'DETECTED', ?, ?, ?, 1.0, ?, '["citizen_verified"]', 'MANUAL-CITIZEN', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    incident_id,
+                    report["category"].lower(),
+                    f"Citizen Report: {report['category']}",
+                    sev,
+                    f"Escalated from manual report {report_id}: {review.admin_notes or ''}",
+                    report.get("location_name") or "Reported location",
+                    lat,
+                    lon,
+                    report.get("image_path"),
+                    created_at,
+                    created_at,
+                ),
+            )
+            log_event(
+                connection,
+                incident_id,
+                "escalated",
+                f"Escalated from citizen report {report_id} by {admin_user['full_name']}",
+                actor=admin_user["user_id"],
+                payload={"report_id": report_id, "admin_notes": review.admin_notes},
+            )
+            selected_responders = _dispatch(connection, incident_id, sev, report["category"].lower(), lat, lon)
+            linked_incident_id = incident_id
+
+        updated_report = review_manual_report(
+            connection,
+            report_id=report_id,
+            status=status_target,
+            admin_notes=review.admin_notes,
+            reviewed_by=admin_user["full_name"],
+            linked_incident_id=linked_incident_id,
+        )
+        log_audit(
+            connection,
+            user_id=admin_user["user_id"],
+            action="admin_review_report",
+            target_type="manual_report",
+            target_id=report_id,
+            details={"status": status_target, "linked_incident_id": linked_incident_id},
+        )
+        add_notification(
+            connection,
+            updated_report["user_id"],
+            f"Report {status_target.capitalize()}",
+            f"Your report {report_id} has been {status_target.lower()}. {review.admin_notes or ''}",
+            linked_incident_id or report_id,
+            "info" if status_target != "REJECTED" else "warning",
+        )
+        connection.commit()
+        if linked_incident_id:
+            incident = fetch_incident(connection, linked_incident_id)
+    finally:
+        connection.close()
+
+    await hub.broadcast(
+        "report.reviewed",
+        {"report": updated_report, "linked_incident": incident},
+        roles={"control"},
+    )
+    if incident:
+        await hub.broadcast(
+            "incident.created",
+            {"incident": incident, "dispatched_to": selected_responders},
+            roles={"control"},
+            incident_id=incident["incident_id"],
+        )
+        for r in selected_responders:
+            await hub.broadcast(
+                "incident.alert",
+                {"incident": incident, "assignment": r},
+                responders={r["responder_id"]},
+            )
+
+    return {"report": updated_report, "incident": incident}
 
 
 # ============================================================
@@ -1122,9 +1770,26 @@ async def websocket_endpoint(
     websocket: WebSocket,
     role: str = Query("control"),
     responder_id: str = Query(""),
+    token: str = Query(""),
 ) -> None:
     identity = responder_id or f"{role}-client"
-    client = await hub.connect(websocket, role, identity)
+    authenticated_role = role
+    if token:
+        try:
+            payload = decode_access_token(token)
+            token_role = payload.get("role", "").lower()
+            if token_role == "admin":
+                authenticated_role = "control"
+                identity = payload.get("sub", identity)
+            elif token_role == "responder":
+                authenticated_role = "responder"
+                identity = payload.get("responder_id") or responder_id or payload.get("sub", identity)
+            elif token_role == "citizen":
+                authenticated_role = "citizen"
+                identity = payload.get("sub", identity)
+        except Exception:
+            pass
+    client = await hub.connect(websocket, authenticated_role, identity)
     try:
         while True:
             raw = await websocket.receive_text()

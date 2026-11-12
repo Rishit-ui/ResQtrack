@@ -46,13 +46,21 @@ export const RealtimeProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       if (unmounted) return;
       setStatus('connecting');
 
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const host = window.location.host;
+      const configuredWsUrl = import.meta.env.VITE_WS_URL;
       const roleParam = user?.role === 'ADMIN' ? 'control' : user?.role === 'RESPONDER' ? 'responder' : 'citizen';
       const responderIdParam = user?.responder_id || '';
       const tokenParam = token || '';
+      const query = `role=${roleParam}&responder_id=${responderIdParam}&token=${encodeURIComponent(tokenParam)}`;
 
-      const url = `${protocol}//${host}/ws?role=${roleParam}&responder_id=${responderIdParam}&token=${encodeURIComponent(tokenParam)}`;
+      let url: string;
+      if (configuredWsUrl) {
+        const cleanBase = configuredWsUrl.replace(/\/$/, '');
+        url = `${cleanBase}/ws?${query}`;
+      } else {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const host = window.location.host;
+        url = `${protocol}//${host}/ws?${query}`;
+      }
 
       try {
         const socket = new WebSocket(url);

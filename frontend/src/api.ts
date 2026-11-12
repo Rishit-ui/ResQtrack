@@ -1,6 +1,8 @@
 import { User, Incident, Responder, ManualReport, Facility, AuditLog, SystemStats, NotificationItem } from './types';
 
-const API_BASE = '/api';
+// In production on Vercel, requests can target VITE_API_URL or fall back to local origin /api
+const BACKEND_URL = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
+const API_BASE = BACKEND_URL ? `${BACKEND_URL}/api` : '/api';
 
 export function getToken(): string | null {
   return localStorage.getItem('resqtrack_token');

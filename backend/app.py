@@ -19,6 +19,7 @@ Run it with:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -93,9 +94,21 @@ app = FastAPI(
     version="3.0",
 )
 
+# Dynamic CORS configuration: Allow localhost, Vercel deployments, and custom domains
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get(
+        "ALLOWED_ORIGINS",
+        "http://localhost:5173,http://localhost:3000,http://localhost:8000,http://127.0.0.1:5173,http://127.0.0.1:8000"
+    ).split(",")
+    if origin.strip()
+]
+# If wildcard or empty, allow all for dev / preview deployments
+CORS_ALLOW_ALL = os.environ.get("CORS_ALLOW_ALL", "true").lower() in ("true", "1", "yes")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"] if CORS_ALLOW_ALL else ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

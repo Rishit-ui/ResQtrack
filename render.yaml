@@ -1,0 +1,29 @@
+services:
+  # Backend FastAPI Web Service
+  - type: web
+    name: resqtrack-backend
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn backend.app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/system/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: RESQTRACK_DB
+        value: /var/data/resqtrack.db
+      - key: RESQTRACK_SNAPSHOTS
+        value: /var/data/snapshots
+      - key: RESQTRACK_JWT_SECRET
+        generateValue: true
+      - key: RESQTRACK_ALGORITHM
+        value: HS256
+      - key: RESQTRACK_HTTP_TIMEOUT
+        value: "3.0"
+      - key: CORS_ALLOW_ALL
+        value: "true"
+    disk:
+      name: resqtrack-data
+      mountPath: /var/data
+      sizeGB: 1

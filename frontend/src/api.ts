@@ -42,20 +42,45 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
     headers['Authorization'] = `Bearer ${token}`;
   }
 
-  const response = await fetch(`${API_BASE}${endpoint}`, {
-    ...options,
-    headers,
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}${endpoint}`, {
+      ...options,
+      headers,
+    });
+  } catch (networkErr: any) {
+    throw new Error(
+      `Network Error: Unable to reach emergency backend service at ${API_BASE}. Please verify your internet connection or backend deployment status.`
+    );
+  }
 
   if (!response.ok) {
-    let errMessage = `Error ${response.status}: ${response.statusText}`;
+    let errMessage = '';
+    let parsedDetail: any = null;
     try {
       const errData = await response.json();
       if (errData && errData.detail) {
+        parsedDetail = errData.detail;
         errMessage = typeof errData.detail === 'string' ? errData.detail : JSON.stringify(errData.detail);
       }
     } catch {
-      // ignore
+      // response body was not JSON (e.g. 404 HTML from Vercel)
+    }
+
+    if (!errMessage) {
+      if (response.status === 404) {
+        errMessage = `API endpoint not found (404) at ${API_BASE}${endpoint}. The frontend is either pointing to an incorrect backend URL or the route does not exist.`;
+      } else if (response.status === 401) {
+        errMessage = 'Invalid credentials. Please verify your email and password.';
+      } else if (response.status === 403) {
+        errMessage = 'Access forbidden (403): You do not have permission to perform this action.';
+      } else if (response.status === 429) {
+        errMessage = 'Rate limit exceeded: Too many requests. Please wait a minute before trying again.';
+      } else if (response.status >= 500) {
+        errMessage = `Backend server error (${response.status}). Emergency service is encountering an internal error.`;
+      } else {
+        errMessage = `Request failed (${response.status}: ${response.statusText || 'Unknown error'})`;
+      }
     }
     throw new Error(errMessage);
   }

@@ -1,8 +1,10 @@
 import { User, Incident, Responder, ManualReport, Facility, AuditLog, SystemStats, NotificationItem } from './types';
 
-// In production on Vercel, requests can target VITE_API_URL or fall back to local origin /api
-const BACKEND_URL = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
-const API_BASE = BACKEND_URL ? `${BACKEND_URL}/api` : '/api';
+// Default production backend URL for ResQTrack
+const DEFAULT_BACKEND_URL = 'https://resqtrack-1.onrender.com';
+const RAW_URL = import.meta.env.VITE_API_URL || DEFAULT_BACKEND_URL;
+const BACKEND_URL = RAW_URL.replace(/\/$/, '');
+const API_BASE = BACKEND_URL.endsWith('/api') ? BACKEND_URL : `${BACKEND_URL}/api`;
 
 export function getToken(): string | null {
   return localStorage.getItem('resqtrack_token');

@@ -46,7 +46,8 @@ export const RealtimeProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       if (unmounted) return;
       setStatus('connecting');
 
-      const configuredWsUrl = import.meta.env.VITE_WS_URL;
+      const DEFAULT_WS_URL = 'wss://resqtrack-1.onrender.com';
+      const configuredWsUrl = import.meta.env.VITE_WS_URL || DEFAULT_WS_URL;
       const roleParam = user?.role === 'ADMIN' ? 'control' : user?.role === 'RESPONDER' ? 'responder' : 'citizen';
       const responderIdParam = user?.responder_id || '';
       const tokenParam = token || '';
